@@ -28,8 +28,8 @@ CYCLS_API_KEY=...                     # cycls.remote calls the engine with it
 
 `.use(Studio())` adds the `studio` tool to every `llm.run()` of the agent and mounts the route the
 app calls Blender through. Without the env vars, the tool isn't offered. A person can switch it off
-in Settings like a builtin. It needs a `cycls` with the extension hook (`cycls.Extension`): until
-that ships, the SDK's `feat/extensions` branch.
+in Settings like a builtin. It needs a `cycls` with the extension hook (`cycls.Extension`):
+the SDK's `feat/extensions` branch until it reaches main.
 
 ## What's here
 

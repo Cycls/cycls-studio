@@ -5,14 +5,15 @@ description = "A Blender-style 3D studio for Cycls agents: build a scene in chat
 readme = "README.md"
 requires-python = ">=3.10"
 # Needs a cycls with the extension hook (cycls.Extension, Web().use) and the app bridge's
-# engine/onCommand/ask — the SDK's feat/extensions branch until it is released.
+# engine/onCommand/ask: the SDK's feat/extensions branch until it reaches main.
 dependencies = ["cycls"]
 
 [dependency-groups]
 test = ["pytest>=8.0.0", "python-multipart>=0.0.6"]
 
+# The SDK branch that carries the hook, until it reaches main.
 [tool.uv.sources]
-cycls = { path = "../cycls-sdk-ext", editable = true }
+cycls = { git = "https://github.com/Cycls/cycls", branch = "feat/extensions" }
 
 [build-system]
 requires = ["hatchling"]

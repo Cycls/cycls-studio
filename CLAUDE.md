@@ -35,8 +35,9 @@ cd engine && cycls deploy render_fn.py                 # the engine, Python 3.12
 cd engine && PYTHONPATH=.. python studio_try.py dev selftest evaluate snapshot   # engine code on a cloud executor
 ```
 
-`pyproject.toml` points `cycls` at a local SDK checkout (`../cycls-sdk-ext`, the
-`feat/extensions` branch) until the extension hook is released.
+The package needs a `cycls` with the extension hook. Until that reaches the SDK's main,
+`pyproject.toml` points at its `feat/extensions` branch (`[tool.uv.sources]`). This repo is not
+published to PyPI.
 
 ## Gotchas
 
