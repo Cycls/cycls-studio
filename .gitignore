@@ -1,0 +1,13 @@
+node_modules/
+__pycache__/
+.venv/
+/dist/
+*.egg-info/
+.env
+.providers.env
+app/dist/
+app/dev/ws/
+app/dev/shots/
+app/dev/host.js
+engine/out/
+uv.lock

@@ -1,0 +1,757 @@
+"""The `studio` tool and its plumbing, with the Blender engine faked."""
+import asyncio
+import base64
+import json
+import pathlib
+
+import cycls
+import pytest
+
+import cycls_studio
+from cycls._agent import extension, tools      # the SDK side of the seam: what an agent's loop sees
+from cycls_studio import install, store, tool, video
+from cycls_studio import scene as S
+from cycls._app.db import workspace
+
+PNG = b"\x89PNG\r\n\x1a\nfake"
+JPG = b"\xff\xd8\xff\xe0fake-jpeg"
+
+
+def _png(w, h, alpha=False):
+    """A real (tiny) PNG, for header parsing."""
+    import struct
+    import zlib
+    px = (b"\x00" + b"\x80" * (w * (4 if alpha else 3))) * h
+
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6 if alpha else 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(px)) + chunk(b"IEND", b""))
+
+
+def _ws(root):
+    return workspace(root.name, root.parent, base=f"file://{root}")
+
+
+@pytest.fixture(autouse=True, scope="module")
+def registered():
+    """What the server does for `Web().use(Studio())` when it's built."""
+    extension.register(cycls_studio.Studio())
+
+
+@pytest.fixture(autouse=True)
+def env(monkeypatch):
+    monkeypatch.setenv("CYCLS_STUDIO_ENGINE", "cycls-render")
+    monkeypatch.setenv("CYCLS_API_KEY", "test-key")
+    monkeypatch.delenv("CYCLS_STUDIO_RENDERER", raising=False)
+    monkeypatch.setattr(tool, "_view", _no_view)
+
+
+async def _no_view(ws):
+    return {}
+
+
+def _viewing(monkeypatch, view):
+    async def fake(ws):
+        return view
+    monkeypatch.setattr(tool, "_view", fake)
+
+
+@pytest.fixture
+def root(tmp_path):
+    return tmp_path
+
+
+class FakeEngine:
+    """Records calls; answers each op the way cycls-render does."""
+
+    def __init__(self):
+        self.calls = []
+        self.fail = None
+        self.cached = {}          # workspace key → file names, as cycls-render keeps them
+
+    def __call__(self, name, timeout=None, **_):
+        def fn(**kw):
+            self.calls.append({"name": name, **kw})
+            if self.fail:
+                return {"ok": False, "error": self.fail}
+            if kw.get("cache"):
+                have = self.cached.setdefault(kw["cache"], set())
+                have |= {n.removesuffix(".gz") for n in kw["blobs"] if n.startswith(("meshes/", "textures/"))}
+                missing = [n for n in kw.get("refs", []) if n not in have]
+                if missing:
+                    return {"ok": False, "missing": missing, "error": "not cached"}
+            op = kw["op"]
+            if op == "snapshot":
+                return {"ok": True, "result": {"preview": "preview.jpg", "resolution": [640, 360]},
+                        "files": {"preview.jpg": JPG}}
+            if op == "render":
+                return {"ok": True, "result": {"png": "render.png", "preview": "preview.jpg",
+                                               "render_seconds": 23.4, "resolution": [1280, 720], "samples": 32},
+                        "files": {"render.png": PNG, "preview.jpg": JPG}}
+            if op == "apply":
+                return {"ok": True, "result": {"mesh_id": "m-0123456789ab", "mesh": "mesh.json", "verts": 12,
+                                               "faces": 10, "bbox": [[-1, -1, -1], [1, 1, 1]],
+                                               "modifiers": [] if kw["params"]["op"] == "modifier_apply" else None,
+                                               "removed": kw["params"].get("others", []),
+                                               **({"selection": {"faces": [2, 3]}} if kw["params"]["op"] == "bevel" else {})},
+                        "files": {"mesh.json": b'{"format": "cycls.mesh"}'}}
+            if op == "script":
+                doc, _ = S.apply_ops(kw["scene"], [{"op": "add", "id": "scripted", "type": "empty"}])
+                return {"ok": True, "result": {"scene": doc, "notes": ["curve baked"], "stdout": "hello\n"},
+                        "files": {}}
+            if op == "import":
+                frag = S.normalize({"objects": {"cube": {"type": "mesh", "mesh": "m-aaaaaaaaaaaa"}},
+                                    "meshes": {"m-aaaaaaaaaaaa": {"data": "meshes/m-aaaaaaaaaaaa.json"}}})
+                return {"ok": True, "result": {"scene": frag, "notes": [], **getattr(self, "import_extra", {})},
+                        "files": {"meshes_out/m-aaaaaaaaaaaa.json": b'{"format": "cycls.mesh"}'}}
+            if op == "texture":
+                return {"ok": True, "result": {"file": "texture.png", "width": 64, "height": 32, "alpha": True},
+                        "files": {"texture.png": _png(64, 32, alpha=True)}}
+            if op == "export":
+                ext = kw["params"]["format"]
+                return {"ok": True, "result": {"file": f"export.{ext}", "format": ext},
+                        "files": {f"export.{ext}": b"model-bytes"}}
+            if op == "video":
+                a, b = kw["params"]["frames"]
+                return {"ok": True, "result": {"segment": "segment.mp4", "frames": [a, b], "render_seconds": 4.0 * (b - a + 1),
+                                               "seconds_per_frame": 4.0, "resolution": kw["params"]["resolution"]},
+                        "files": {"segment.mp4": f"[{a}-{b}]".encode(),
+                                  **({"poster.jpg": JPG} if kw["params"].get("poster") else {})}}
+            if op == "encode":
+                segs = [kw["blobs"][f"segments/s-{i:03d}.mp4"] for i in range(kw["params"]["segments"])]
+                return {"ok": True, "result": {"video": "video.mp4", "frames": 0}, "files": {"video.mp4": b"".join(segs)}}
+            raise AssertionError(op)
+        return fn
+
+
+@pytest.fixture
+def engine(monkeypatch):
+    fake = FakeEngine()
+    monkeypatch.setattr(cycls, "remote", fake)
+    return fake
+
+
+def run(inp, root):
+    return asyncio.run(tool.run(inp, _ws(root)))
+
+
+def scene(root):
+    return json.loads((root / "apps/studio/data/scene.json").read_text())
+
+
+def _text(out):
+    if isinstance(out, str):
+        return out
+    m = out["_model"]
+    return m if isinstance(m, str) else " ".join(b.get("text", "") for b in m)
+
+
+def _uis(out):
+    ui = out.get("_ui") if isinstance(out, dict) else None
+    return ui if isinstance(ui, list) else [ui] if ui else []
+
+
+# ─── gate + registry ────────────────────────────────────────────────────────
+
+def test_build_tools_gates_on_engine_and_key(monkeypatch):
+    assert [t["name"] for t in tools.build_tools(["Studio"], [], vendor="openai")] == ["studio"]
+    monkeypatch.delenv("CYCLS_STUDIO_ENGINE")
+    assert tools.build_tools(["Studio"], [], vendor="openai") == []
+    monkeypatch.setenv("CYCLS_STUDIO_ENGINE", "cycls-render")
+    monkeypatch.delenv("CYCLS_API_KEY")
+    monkeypatch.setattr(cycls, "api_key", None, raising=False)
+    assert tools.build_tools(["Studio"], [], vendor="openai") == []
+
+
+def test_registered_with_guidance_and_label():
+    assert "studio" in tools._TOOLS
+    assert "## Studio (3D)" in "\n".join(tools.tool_prompts([tool.STUDIO_TOOL]))
+    assert tools.tool_step("studio", {"action": "edit", "intent": "gold ring"}) == \
+        {"tool_name": "Studio", "step": "edit gold ring"}
+    assert tools.tool_step("studio", {"action": "edit", "ops": [{}, {}]})["step"] == "edit 2 op(s)"
+    assert tools.risk("studio", {"action": "edit"}) is None
+
+
+# ─── installer ──────────────────────────────────────────────────────────────
+
+class TestInstall:
+    def test_fresh_install(self, root):
+        assert asyncio.run(install.ensure_installed(_ws(root))) == "installed"
+        app = root / "apps/studio"
+        assert (app / "index.html").read_text(encoding="utf-8").startswith("<!doctype html>")
+        manifest = json.loads((app / "app.json").read_text())
+        assert manifest["name"] == "Studio" and manifest["studio"]["version"] == install.bundle()[1]
+        assert manifest["extension"] == "Studio"            # so the SDK's build_app leaves it alone
+        assert "Change it with the `studio`" in (app / "README.md").read_text(encoding="utf-8").replace("**", "")
+        assert S.normalize(scene(root)) == S.new_scene()
+
+    def test_idempotent_and_upgrades_the_bundle_only(self, root, tmp_path, monkeypatch):
+        ws = _ws(root)
+        asyncio.run(install.ensure_installed(ws))
+        (root / "apps/studio/data/scene.json").write_text(json.dumps({**S.new_scene(), "rev": 7}))
+        (root / "apps/studio/data/mine.json").write_text("{}")
+        assert asyncio.run(install.ensure_installed(ws)) is None
+        newer = tmp_path / "bundle.html"
+        newer.write_text("<!doctype html><p>v2</p>")
+        monkeypatch.setattr(install, "BUNDLE", newer)
+        assert asyncio.run(install.ensure_installed(ws)) == "upgraded"
+        assert (root / "apps/studio/index.html").read_text() == "<!doctype html><p>v2</p>"
+        assert list(root.glob(".trash/**/index.html")), "the old bundle goes to the trash"
+        assert scene(root)["rev"] == 7 and (root / "apps/studio/data/mine.json").exists()
+
+    def test_refuses_someone_elses_app(self, root):
+        app = root / "apps/studio"
+        app.mkdir(parents=True)
+        (app / "index.html").write_text("<h1>mine</h1>")
+        with pytest.raises(install.InstallError, match="another app"):
+            asyncio.run(install.ensure_installed(_ws(root)))
+        assert "Error: apps/studio/ is another app" in run({"action": "inspect"}, root)
+
+    def test_build_app_will_not_overwrite_studio(self, root, monkeypatch):
+        asyncio.run(install.ensure_installed(_ws(root)))
+        src = root / "src"
+        src.mkdir()
+        (src / "index.html").write_text("<h1>x</h1>")
+        monkeypatch.setattr(cycls, "remote", lambda name, **_: (lambda **kw: {"ok": True, "html": "<h1>built</h1>"}))
+        out = asyncio.run(tools._exec_build_app({"slug": "studio", "source": "src"}, _ws(root)))
+        assert out.startswith("Error: apps/studio is the Studio app")
+
+
+# ─── document actions ───────────────────────────────────────────────────────
+
+class TestEdit:
+    OPS = [{"op": "add", "id": "ring", "primitive": "torus", "material": "gold", "on_floor": True},
+           {"op": "preset", "studio": {"lighting": "dramatic"}}]
+
+    def test_edit_saves_pushes_a_patch_and_keeps_history(self, root):
+        out = run({"action": "edit", "ops": self.OPS, "intent": "gold ring"}, root)
+        assert "Saved rev 1" in _text(out) and "objects.ring" in _text(out)
+        doc = scene(root)
+        assert doc["rev"] == 1 and doc["by"] == "agent" and "ring" in doc["objects"]
+        (ui,) = _uis(out)
+        assert ui["action"] == "app_command" and ui["path"] == "apps/studio/index.html"
+        cmd = ui["command"]
+        assert cmd["type"] == "patch" and cmd["base"] == 0 and cmd["rev"] == 1 and cmd["label"] == "gold ring"
+        assert "objects.ring" in cmd["set"] and "objects.studio_key" in cmd["set"]
+        assert (root / "apps/studio/data/history/0.json").exists()
+
+    def test_a_bad_op_names_the_field_and_saves_nothing(self, root):
+        out = run({"action": "edit", "ops": [{"op": "add", "primitive": "teapot"}]}, root)
+        assert out.startswith("Error: ops[0]") and "meshes.teapot.primitive" in out
+        assert scene(root)["rev"] == 0
+
+    def test_no_change(self, root):
+        run({"action": "edit", "ops": [{"op": "set", "id": "cube", "location": [0, 0, 3]}]}, root)
+        out = run({"action": "edit", "ops": [{"op": "set", "id": "cube", "location": [0, 0, 3]}]}, root)
+        assert out.startswith("No change")
+
+    def test_selected_is_the_viewers_selection(self, root, monkeypatch):
+        _viewing(monkeypatch, {"selection": ["cube"], "mode": "object"})
+        run({"action": "edit", "ops": [{"op": "material", "preset": "chrome", "assign": "selected"}]}, root)
+        assert scene(root)["objects"]["cube"]["materials"] == ["chrome"]
+        assert "[selected]" in run({"action": "inspect"}, root)
+
+    def test_parallel_edits_serialize(self, root):
+        ws = _ws(root)
+
+        async def both():
+            await install.ensure_installed(ws)
+            await asyncio.gather(*[tool.run({"action": "edit", "ops": [
+                {"op": "add", "id": f"c{i}", "primitive": "cube", "location": [i, 0, 0]}]}, ws) for i in range(6)])
+        asyncio.run(both())
+        doc = scene(root)
+        assert doc["rev"] == 6 and all(f"c{i}" in doc["objects"] for i in range(6))
+
+    def test_revert(self, root):
+        run({"action": "edit", "ops": self.OPS}, root)
+        out = run({"action": "revert", "rev": 0}, root)
+        assert "rev 0" in _text(out) and "ring" not in scene(root)["objects"] and scene(root)["rev"] == 2
+
+    def test_inspect_and_open(self, root):
+        assert "Scene rev 0" in run({"action": "inspect"}, root)
+        run({"action": "edit", "ops": self.OPS}, root)
+        out = run({"action": "open"}, root)
+        assert out["action"] == "open_canvas" and out["path"] == "apps/studio/index.html"
+        assert "Scene rev 1" in out["ack"] and "- ring (mesh torus" in out["ack"]     # not "empty"
+
+
+# ─── images ─────────────────────────────────────────────────────────────────
+
+class TestImages:
+    @pytest.fixture
+    def logo(self, root):
+        (root / "uploads").mkdir()
+        (root / "uploads/logo.png").write_bytes(_png(400, 100, alpha=True))
+        return "uploads/logo.png"
+
+    def test_an_image_plane_from_a_workspace_file(self, root, logo):
+        run({"action": "edit", "ops": [{"op": "add", "id": "sign", "image": {"path": logo}, "height": 0.5}]}, root)
+        doc = scene(root)
+        tex = doc["textures"]["logo"]
+        assert (tex["width"], tex["height"], tex["alpha"]) == (400, 100, True)
+        side = json.loads((root / "apps/studio/data" / tex["data"]).read_text())
+        assert side["format"] == "cycls.texture" and side["media_type"] == "image/png"
+        assert base64.b64decode(side["data"]) == (root / logo).read_bytes()
+        sign = doc["objects"]["sign"]
+        assert sign["scale"] == [4.0, 1, 1] and doc["materials"][sign["materials"][0]]["base_color_texture"] == "logo"
+
+    def test_one_image_used_twice_is_one_texture_and_an_unused_one_is_dropped(self, root, logo):
+        run({"action": "edit", "ops": [
+            {"op": "texture", "path": logo, "name": "spare"},
+            {"op": "material", "id": "material", "base_color_texture": {"path": logo},
+             "roughness_texture": {"path": logo}}]}, root)
+        doc = scene(root)
+        assert list(doc["textures"]) == ["logo"]
+        assert doc["materials"]["material"]["roughness_texture"] == "logo"
+
+    def test_other_formats_go_through_blender(self, root, engine):
+        (root / "photo.webp").write_bytes(b"RIFF....WEBP")
+        run({"action": "edit", "ops": [{"op": "material", "id": "material",
+                                        "base_color_texture": {"path": "photo.webp"}}]}, root)
+        call = engine.calls[-1]
+        assert call["op"] == "texture" and list(call["blobs"]) == ["texture_in.webp"]
+        tex = scene(root)["textures"]["photo"]
+        assert (tex["width"], tex["height"], tex["alpha"]) == (64, 32, True)
+
+    def test_drawing_ops_get_the_image_bytes_geometry_ops_dont(self, root, logo, engine):
+        run({"action": "edit", "ops": [{"op": "material", "id": "material", "base_color_texture": {"path": logo}}]},
+            root)
+        rel = scene(root)["textures"]["logo"]["data"]
+        run({"action": "snapshot"}, root)
+        assert engine.calls[-1]["blobs"] == {rel[:-5] + ".png": (root / logo).read_bytes()}
+        run({"action": "apply", "id": "cube", "operation": "convert"}, root)
+        assert engine.calls[-1]["blobs"] == {}
+
+    def test_a_bad_path_names_it(self, root):
+        out = run({"action": "edit", "ops": [{"op": "add", "image": {"path": "nope.png"}}]}, root)
+        assert out.startswith("Error: nope.png does not exist")
+        out = run({"action": "edit", "ops": [{"op": "add", "image": {"path": "../../etc/passwd.png"}}]}, root)
+        assert out.startswith("Error:")
+
+
+# ─── engine actions ─────────────────────────────────────────────────────────
+
+class TestEngine:
+    def test_big_files_go_up_gzipped_and_come_back_unpacked(self, engine, monkeypatch):
+        import gzip
+        from cycls_studio import engine as E
+        mesh = '{"format": "cycls.mesh", "co": "' + "AAAA" * 200_000 + '"}'          # repetitive: shrinks
+        photo = bytes(range(256)) * 1500                                             # a render coming back packed
+        noise = __import__("os").urandom(400_000)
+        sent = E.pack({"meshes/m-0123456789ab.json": mesh, "texture_in.png": noise, "small.json": "{}"})
+        assert set(sent) == {"meshes/m-0123456789ab.json.gz", "texture_in.png", "small.json"}
+        assert gzip.decompress(sent["meshes/m-0123456789ab.json.gz"]) == mesh.encode()
+        assert len(sent["meshes/m-0123456789ab.json.gz"]) < len(mesh) / 10
+        assert E.unpack({"render.png.gz": gzip.compress(photo), "preview.jpg": b"j"}) == {"render.png": photo,
+                                                                                          "preview.jpg": b"j"}
+        monkeypatch.setenv("CYCLS_STUDIO_ENGINE", "cycls-render")
+        asyncio.run(E.call("snapshot", S.new_scene(), blobs={"meshes/m-0123456789ab.json": mesh}))
+        assert engine.calls[-1]["gzip"] is True and list(engine.calls[-1]["blobs"]) == ["meshes/m-0123456789ab.json.gz"]
+
+    def test_meshes_go_once_then_by_name(self, root, engine):
+        run({"action": "apply", "id": "cube", "operation": "convert"}, root)        # an explicit mesh file
+        n = len(engine.calls)
+        run({"action": "snapshot"}, root)
+        first = engine.calls[n:]
+        assert [list(c["blobs"]) for c in first] == [[], ["meshes/m-0123456789ab.json"]]   # asked, then sent
+        assert first[0]["refs"] == ["meshes/m-0123456789ab.json"] and len(first[0]["cache"]) == 32
+        n = len(engine.calls)
+        run({"action": "edit", "ops": [{"op": "world", "strength": 2}], "snapshot": True}, root)
+        assert [list(c["blobs"]) for c in engine.calls[n:]] == [[]]                         # kept: nothing goes up
+
+    def test_the_cache_is_per_workspace(self, root, monkeypatch):
+        import types as t
+        from cycls_studio import engine as E
+        monkeypatch.setattr("cycls._function.main._get_api_key", lambda: "k1")
+        a, b = E.cache_key(t.SimpleNamespace(root=str(root))), E.cache_key(t.SimpleNamespace(root=str(root / "x")))
+        assert a != b and len(a) == 32
+        monkeypatch.setattr("cycls._function.main._get_api_key", lambda: "k2")
+        assert E.cache_key(t.SimpleNamespace(root=str(root))) != a                          # another key, another shelf
+
+    def test_snapshot_sends_the_scene_and_returns_the_image(self, root, engine):
+        out = run({"action": "snapshot"}, root)
+        call = engine.calls[-1]
+        assert call["name"] == "cycls-render" and call["op"] == "snapshot" and call["scene"]["format"] == S.FORMAT
+        assert out["_model"][0]["source"]["data"] == base64.b64encode(JPG).decode()
+        assert _uis(out)[0]["command"]["preview"].startswith("data:image/jpeg;base64,")
+
+    def test_edit_with_snapshot(self, root, engine):
+        out = run({"action": "edit", "ops": [{"op": "delete", "id": "light"}], "snapshot": True}, root)
+        assert out["_model"][0]["type"] == "image" and len(_uis(out)) == 2
+
+    def test_render_saves_logs_and_opens(self, root, engine, monkeypatch):
+        monkeypatch.setenv("CYCLS_STUDIO_RENDERER", "cycls-render-big")
+        out = run({"action": "render", "name": "Gold Ring"}, root)
+        assert engine.calls[-1]["name"] == "cycls-render-big"
+        assert (root / "renders/gold-ring.png").read_bytes() == PNG
+        log = json.loads((root / "apps/studio/data/renders.json").read_text())
+        assert log[-1]["path"] == "renders/gold-ring.png" and log[-1]["samples"] == 32
+        opened, done = _uis(out)
+        assert opened["action"] == "open_canvas" and done["command"]["type"] == "render_done"
+        run({"action": "render", "name": "Gold Ring"}, root)
+        assert (root / "renders/gold-ring-2.png").exists()
+
+    def test_apply_writes_the_mesh_and_rewires_the_object(self, root, engine):
+        out = run({"action": "apply", "id": "cube", "operation": "bevel",
+                   "params": {"selection": "all", "width": 0.1}}, root)
+        assert "Applied bevel to cube" in _text(out)
+        assert engine.calls[-1]["params"] == {"id": "cube", "op": "bevel", "selection": "all", "width": 0.1}
+        doc = scene(root)
+        assert doc["objects"]["cube"]["mesh"] == "m-0123456789ab"
+        assert doc["meshes"] == {"m-0123456789ab": {"data": "meshes/m-0123456789ab.json", "verts": 12,
+                                                    "faces": 10, "bbox": [[-1, -1, -1], [1, 1, 1]]}}
+        assert (root / "apps/studio/data/meshes/m-0123456789ab.json").exists()
+        # The next engine call carries the mesh file with the scene.
+        run({"action": "snapshot"}, root)
+        assert list(engine.calls[-1]["blobs"]) == ["meshes/m-0123456789ab.json"]
+
+    def test_apply_on_the_viewers_edit_selection(self, root, engine, monkeypatch):
+        edit = {"object": "cube", "mesh": "cube", "mode": "face", "items": [5, 2], "count": 2}
+        _viewing(monkeypatch, {"selection": ["cube"], "mode": "edit", "edit": edit})
+        assert "Edit mode on cube: 2 faces selected" in run({"action": "inspect"}, root)
+        run({"action": "apply", "id": "selected", "operation": "bevel", "params": {"selection": "selected"}}, root)
+        assert engine.calls[-1]["params"] == {"id": "cube", "op": "bevel", "selection": {"faces": [5, 2]}}
+
+    def test_edit_selection_on_another_mesh_is_refused(self, root, engine, monkeypatch):
+        # The app hasn't saved its mesh yet: its indices are about geometry the scene doesn't have.
+        edit = {"object": "cube", "mesh": "m-ffffffffffff", "mode": "vert", "items": [0], "count": 1}
+        _viewing(monkeypatch, {"selection": ["cube"], "mode": "edit", "edit": edit})
+        assert "Edit mode" not in run({"action": "inspect"}, root)
+        out = run({"action": "apply", "id": "cube", "operation": "subdivide", "params": {"selection": "selected"}}, root)
+        assert out.startswith("Error: nothing is selected in Edit mode on cube") and not engine.calls
+
+    def test_edit_selection_too_big_to_pass_on(self, root, engine, monkeypatch):
+        edit = {"object": "cube", "mesh": "cube", "mode": "vert", "items": None, "count": 90000}
+        _viewing(monkeypatch, {"selection": ["cube"], "mode": "edit", "edit": edit})
+        assert "too many to pass on" in run({"action": "inspect"}, root)
+        out = run({"action": "apply", "id": "cube", "operation": "bevel", "params": {"selection": "selected"}}, root)
+        assert out.startswith("Error: too many elements") and not engine.calls
+
+    def test_a_save_sweeps_old_mesh_files_nothing_uses(self, root, engine):
+        import os
+        import time
+        run({"action": "apply", "id": "cube", "operation": "convert"}, root)        # the scene uses m-0123456789ab
+        meshes = root / "apps/studio/data/meshes"
+        used, stale, fresh = meshes / "m-0123456789ab.json", meshes / "m-aaaaaaaaaaaa.json", meshes / "m-bbbbbbbbbbbb.json"
+        stale.write_text("{}")
+        fresh.write_text("{}")                                                      # an open app's, maybe
+        day_ago = time.time() - 2 * 86400
+        for p in (used, stale):
+            os.utime(p, (day_ago, day_ago))
+        run({"action": "edit", "ops": [{"op": "set", "id": "cube", "location": [0, 0, 2]}]}, root)
+        assert used.exists() and fresh.exists() and not stale.exists()
+
+    def test_apply_join_removes_the_others(self, root, engine):
+        run({"action": "edit", "ops": [{"op": "add", "id": "b", "primitive": "cube", "location": [3, 0, 0]}]}, root)
+        out = run({"action": "apply", "id": "cube", "operation": "join", "params": {"others": ["b"]}}, root)
+        assert "removed: b" in _text(out) and "b" not in scene(root)["objects"]
+
+    def test_script_replaces_the_scene_and_reports(self, root, engine):
+        out = run({"action": "script", "code": "print('hello')"}, root)
+        assert "scripted" in scene(root)["objects"]
+        assert "curve baked" in _text(out) and "hello" in _text(out)
+
+    def test_import_merges_with_renamed_ids(self, root, engine):
+        (root / "model.glb").write_bytes(b"glTF")
+        out = run({"action": "import", "path": "model.glb"}, root)
+        assert engine.calls[-1]["blobs"] == {"import.glb": b"glTF"}
+        doc = scene(root)
+        assert "cube_2" in doc["objects"] and doc["objects"]["cube_2"]["mesh"] == "m-aaaaaaaaaaaa"
+        assert "cube_2" in _text(out)
+        assert (root / "apps/studio/data/meshes/m-aaaaaaaaaaaa.json").exists()
+        assert run({"action": "import", "path": "notes.txt"}, root).startswith("Error:")
+
+    def test_a_blend_brings_its_world_and_names_its_camera(self, root, engine):
+        (root / "venue.blend").write_bytes(b"BLENDER")
+        engine.import_extra = {"world": {"kind": "hdri", "hdri": "courtyard", "strength": 1.0}, "camera": "cube"}
+        out = run({"action": "import", "path": "venue.blend"}, root)
+        assert scene(root)["world"]["hdri"] == "courtyard"                   # the Studio's default world gave way
+        assert "took the file's world" in _text(out) and "the file's camera is 'cube_2'" in _text(out)
+        run({"action": "edit", "ops": [{"op": "world", "hdri": "night"}]}, root)
+        run({"action": "import", "path": "venue.blend"}, root)
+        assert scene(root)["world"]["hdri"] == "night"                       # a world someone chose stays
+
+    def test_export(self, root, engine):
+        out = run({"action": "export", "format": "glb", "name": "scene"}, root)
+        assert (root / "exports/scene.glb").read_bytes() == b"model-bytes"
+        assert _uis(out)[0]["action"] == "open_canvas"
+        assert run({"action": "export", "format": "blend"}, root).startswith("Exported the scene to exports/scene")
+
+    def test_engine_errors_are_plain_sentences(self, root, engine):
+        engine.fail = "the scene has no render camera — add one (render.camera)"
+        assert run({"action": "render"}, root) == "Error: the scene has no render camera — add one (render.camera)"
+
+    def test_engine_unreachable(self, root, monkeypatch):
+        def boom(name, timeout=None, **_):
+            def fn(**kw):
+                raise ConnectionError("down")
+            return fn
+        monkeypatch.setattr(cycls, "remote", boom)
+        assert "unavailable" in run({"action": "snapshot"}, root)
+
+
+# ─── the app's engine route ─────────────────────────────────────────────────
+
+class TestRoute:
+    @pytest.fixture
+    def client(self, root, engine):
+        from fastapi import Depends, FastAPI
+        from fastapi.testclient import TestClient
+        from cycls_studio import route
+        route._calls.clear(); route._renders.clear(); route._rendering.clear()
+        ws = _ws(root)
+        app = FastAPI()
+        app.include_router(route.studio_router(Depends(lambda: ws), Depends(lambda: object())))
+        asyncio.run(install.ensure_installed(ws))
+        return TestClient(app)
+
+    def test_only_the_installed_studio(self, client, root):
+        assert client.post("/apps/other/engine", json={"op": "snapshot"}).status_code == 404
+        (root / "apps/studio/app.json").write_text("{}")
+        assert client.post("/apps/studio/engine", json={"op": "snapshot"}).status_code == 404
+
+    def test_only_app_ops(self, client):
+        for op in ("script", "import", "selftest", "nope"):
+            r = client.post("/apps/studio/engine", json={"op": op})
+            assert r.status_code == 400 and "op: one of" in r.json()["detail"]
+
+    def test_snapshot_uses_the_apps_scene(self, client, engine):
+        doc, _ = S.apply_ops(S.new_scene(), [{"op": "add", "id": "unsaved", "primitive": "cube"}])
+        r = client.post("/apps/studio/engine", json={"op": "snapshot", "scene": doc})
+        assert r.json()["preview"].startswith("data:image/jpeg;base64,")
+        assert "unsaved" in engine.calls[-1]["scene"]["objects"]
+
+    def test_render_is_saved_before_the_answer(self, client, root):
+        r = client.post("/apps/studio/engine", json={"op": "render", "name": "Hero"}).json()
+        assert r["path"] == "renders/hero.png" and (root / "renders/hero.png").read_bytes() == PNG
+        assert json.loads((root / "apps/studio/data/renders.json").read_text())[-1]["by"] == "app"
+
+    def test_apply_writes_the_mesh_the_app_then_references(self, client, root):
+        r = client.post("/apps/studio/engine", json={"op": "apply", "params": {"id": "cube", "op": "bevel"}}).json()
+        assert r["data"] == "meshes/m-0123456789ab.json"
+        assert (root / "apps/studio/data/meshes/m-0123456789ab.json").exists()
+        assert r["selection"] == {"faces": [2, 3]}                  # what Blender left selected, for Edit mode
+
+    def test_open_is_only_for_what_the_studio_made(self, client, root):
+        r = client.post("/apps/studio/engine", json={"op": "render", "name": "Hero"}).json()
+        assert client.post("/apps/studio/engine", json={"op": "open", "params": {"path": r["path"]}}).json() ==             {"ok": True, "open": "renders/hero.png"}
+        (root / "renders/other.png").write_bytes(PNG)                     # there, but not a Studio render
+        (root / "exports").mkdir(exist_ok=True)
+        (root / "exports/scene.glb").write_bytes(b"glb")
+        for path, code in (("renders/other.png", 404), ("exports/scene.glb", 200), ("../x", 404),
+                           ("apps/studio/index.html", 404), ("renders/../apps/x.png", 404)):
+            assert client.post("/apps/studio/engine", json={"op": "open", "params": {"path": path}}).status_code == code
+
+    def test_bad_scene_or_missing_mesh_is_a_400(self, client):
+        r = client.post("/apps/studio/engine", json={"op": "snapshot", "scene": {"objects": {"x": {"type": "teapot"}}}})
+        assert r.status_code == 400 and "objects.x.type" in r.json()["detail"]
+        doc = S.normalize({"objects": {"m": {"type": "mesh", "mesh": "q"}},
+                           "meshes": {"q": {"data": "meshes/m-ffffffffffff.json"}}})
+        r = client.post("/apps/studio/engine", json={"op": "snapshot", "scene": doc})
+        assert r.status_code == 400 and "missing" in r.json()["detail"]
+
+    def test_engine_failure_is_an_answer_not_an_error(self, client, engine):
+        engine.fail = "the scene has no render camera"
+        assert client.post("/apps/studio/engine", json={"op": "render"}).json() == \
+            {"ok": False, "error": "the scene has no render camera"}
+
+    def test_budget(self, client, monkeypatch):
+        from cycls_studio import route
+        monkeypatch.setattr(route, "CALLS_PER_MINUTE", 3)
+        codes = [client.post("/apps/studio/engine", json={"op": "snapshot"}).status_code for _ in range(4)]
+        assert codes == [200, 200, 200, 429]
+
+
+# ─── video ──────────────────────────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def fresh_video_state():
+    video._slots = None
+    video._locks.clear()
+    video._frames.clear()
+    yield
+    video._slots = None
+
+
+def _spinning(root):
+    """A saved scene with a five-second turntable (120 frames at 24 fps)."""
+    run({"action": "edit", "ops": [{"op": "turntable"}]}, root)
+    return scene(root)
+
+
+class TestVideo:
+    @pytest.fixture
+    def client(self, root, engine):
+        from fastapi import Depends, FastAPI
+        from fastapi.testclient import TestClient
+        from cycls_studio import route
+        route._calls.clear(); route._renders.clear(); route._rendering.clear()
+        ws = _ws(root)
+        app = FastAPI()
+        app.include_router(route.studio_router(Depends(lambda: ws), Depends(lambda: object())))
+        asyncio.run(install.ensure_installed(ws))
+        return TestClient(app)
+
+    @staticmethod
+    def op(client, op, **params):
+        return client.post("/apps/studio/engine", json={"op": op, "params": params}).json()
+
+    def test_a_still_scene_has_nothing_to_render(self, client):
+        r = self.op(client, "video_start")
+        assert r == {"ok": False, "error": r["error"]} and "nothing moves" in r["error"]
+
+    def test_chunks_sized_from_the_measured_pace_then_joined_in_order(self, client, root, engine):
+        _spinning(root)
+        job = self.op(client, "video_start", name="Spin")["job"]
+        assert job["frames"] == [1, 120] and job["resolution"] == [1280, 720] and job["samples"] == 16
+        assert job["status"] == "running" and job["done"] == 0 and job["seconds_left"] > 0
+        sizes = []
+        while True:
+            r = self.op(client, "video_chunk", job=job["id"])
+            assert r["ok"], r
+            if "chunk" not in r:
+                break
+            call = engine.calls[-1]
+            assert call["op"] == "video" and call["params"]["poster"] == (r["chunk"] == 0)
+            sizes.append(call["params"]["frames"])
+        # the first chunk is short (it measures); then ~240 s of Blender at the measured 4 s a frame
+        assert sizes == [[1, 6], [7, 66], [67, 120]] and r["job"]["done"] == 120
+        assert r["wait"] == 0                                     # nothing left: finish it
+        seg = root / "apps/studio/data/jobs" / job["id"]
+        assert sorted(p.name for p in seg.glob("s-*.mp4")) == ["s-000.mp4", "s-001.mp4", "s-002.mp4"]
+        done = self.op(client, "video_finish", job=job["id"])
+        assert done["path"] == "renders/spin.mp4" and done["open"] == "renders/spin.mp4"
+        assert done["poster"].startswith("data:image/jpeg;base64,") and done["job"]["status"] == "done"
+        assert (root / "renders/spin.mp4").read_bytes() == b"[1-6][7-66][67-120]"
+        log = json.loads((root / "apps/studio/data/renders.json").read_text())[-1]
+        assert log["video"] is True and log["frames"] == 120 and log["path"] == "renders/spin.mp4"
+        assert not list(seg.glob("s-*.mp4")) and not (seg / "scene.json").exists()
+        assert self.op(client, "open", path="renders/spin.mp4") == {"ok": True, "open": "renders/spin.mp4"}
+        assert self.op(client, "video_jobs")["jobs"][0]["path"] == "renders/spin.mp4"
+
+    def test_the_agent_starts_it_and_the_app_is_told(self, root, engine):
+        _spinning(root)
+        out = run({"action": "render", "animation": True, "name": "loop"}, root)
+        assert "Started video v-" in _text(out) and "don't wait" in _text(out)
+        opened, cmd = _uis(out)
+        assert opened["action"] == "open_canvas" and opened["path"] == "apps/studio/index.html"
+        assert cmd["command"]["type"] == "video" and cmd["command"]["job"].startswith("v-")
+        assert "is rendering: 0/120 frames" in run({"action": "inspect"}, root)
+        again = run({"action": "render", "animation": True}, root)
+        assert again.startswith("Error: a video is already rendering")
+
+    def test_the_scene_is_the_one_it_started_with(self, client, root, engine):
+        doc = _spinning(root)
+        doc["objects"]["cube"]["name"] = "Unsaved in the app"
+        jid = client.post("/apps/studio/engine", json={"op": "video_start", "scene": doc}).json()["job"]["id"]
+        run({"action": "edit", "ops": [{"op": "delete", "id": "cube"}]}, root)       # the agent carries on meanwhile
+        self.op(client, "video_chunk", job=jid)
+        assert engine.calls[-1]["scene"]["objects"]["cube"]["name"] == "Unsaved in the app"
+
+    def test_cancel_frees_the_slot_and_drops_a_late_chunk(self, client, root, engine, monkeypatch):
+        _spinning(root)
+        jid = self.op(client, "video_start")["job"]["id"]
+        real = video.engine.call
+
+        async def cancelled_meanwhile(*a, **kw):
+            r = await real(*a, **kw)
+            await video.cancel(_ws(root), jid)
+            return r
+        monkeypatch.setattr(video.engine, "call", cancelled_meanwhile)
+        r = self.op(client, "video_chunk", job=jid)
+        assert r["job"]["status"] == "cancelled" and "chunk" not in r
+        assert not (root / "apps/studio/data/jobs" / jid).exists()
+        monkeypatch.setattr(video.engine, "call", real)
+        assert self.op(client, "video_start")["ok"]
+
+    def test_a_stale_claim_is_taken_again_and_three_failures_end_it(self, client, root, engine, monkeypatch):
+        _spinning(root)
+        jid = self.op(client, "video_start")["job"]["id"]
+        path = root / f"apps/studio/data/jobs/{jid}.json"
+        job = json.loads(path.read_text())
+        job["chunks"] = [{"frames": [1, 6], "state": "claimed", "at": 0, "fails": 0}]       # a tab closed mid-chunk
+        job["next"] = 7
+        path.write_text(json.dumps(job))
+        self.op(client, "video_chunk", job=jid)
+        assert engine.calls[-1]["params"]["frames"] == [1, 6]
+        engine.fail = "Blender crashed"
+        r1, r2 = self.op(client, "video_chunk", job=jid), self.op(client, "video_chunk", job=jid)
+        assert r1["wait"] and r1["reason"] == "Blender crashed" and r2["job"]["status"] == "running"
+        r3 = self.op(client, "video_chunk", job=jid)
+        assert r3["job"]["status"] == "failed" and r3["error"] == "Blender crashed"
+        assert "The last video failed: Blender crashed" in run({"action": "inspect"}, root)
+
+    def test_an_hours_frames_then_it_waits(self, client, root, engine, monkeypatch):
+        monkeypatch.setattr(video, "FRAMES_PER_HOUR", 10)
+        _spinning(root)
+        jid = self.op(client, "video_start")["job"]["id"]
+        assert "chunk" in self.op(client, "video_chunk", job=jid)               # 6 frames
+        r = self.op(client, "video_chunk", job=jid)
+        assert r["wait"] >= 60 and "this hour" in r["reason"]
+        assert json.loads((root / f"apps/studio/data/jobs/{jid}.json").read_text())["next"] == 7   # not claimed
+
+    def test_busy_engine_is_a_wait(self, client, root, engine, monkeypatch):
+        monkeypatch.setattr(video, "SLOT_WAIT", 0.05)
+        _spinning(root)
+        jid = self.op(client, "video_start")["job"]["id"]
+
+        async def held():
+            sem = video._slots_now()
+            await sem.acquire()
+            try:
+                return await video.chunk(_ws(root), jid)
+            finally:
+                sem.release()
+        video._slots = None
+        r = asyncio.run(held())
+        assert r["wait"] == 30 and "busy" in r["reason"]
+        video._slots = None
+        assert "chunk" in self.op(client, "video_chunk", job=jid)                 # the same frames, next time
+        assert engine.calls[-1]["params"]["frames"] == [1, 6]
+
+    def test_limits(self, client, root):
+        run({"action": "edit", "ops": [{"op": "turntable", "seconds": 20}]}, root)
+        r = self.op(client, "video_start")
+        assert not r["ok"] and "at most 240" in r["error"]
+        r = self.op(client, "video_start", frames=[1, 48], resolution=[1920, 1080], samples=500)
+        assert r["job"]["resolution"] == [1280, 720] and r["job"]["samples"] == 64
+
+    def test_a_job_keeps_its_scenes_mesh_files(self, root, engine):
+        ws = _ws(root)
+        run({"action": "edit", "ops": [{"op": "turntable"}]}, root)
+        doc = scene(root)
+        store.write_mesh(ws, "m-aaaaaaaaaaaa", '{"format": "cycls.mesh"}')
+        doc["meshes"]["cube"] = {"data": "meshes/m-aaaaaaaaaaaa.json", "verts": 8, "faces": 6,
+                                 "bbox": [[-1, -1, -1], [1, 1, 1]]}
+        asyncio.run(video.start(ws, doc))
+        mesh = root / "apps/studio/data/meshes/m-aaaaaaaaaaaa.json"
+        import os
+        os.utime(mesh, (0, 0))                                                    # old enough to sweep
+        run({"action": "edit", "ops": [{"op": "set", "id": "cube", "name": "x"}]}, root)
+        assert mesh.exists()
+
+
+def test_route_mounts_only_when_configured(monkeypatch):
+    from fastapi import FastAPI
+    from cycls._agent.web import routers
+
+    class _App:
+        config = None
+        connectors = None
+        extensions = [cycls_studio.Studio()]
+
+    def paths(app):
+        return set(app.openapi()["paths"])
+    app = FastAPI()
+    routers.install_routers(_App(), app, None, "/tmp/vol", "file:///tmp/vol")
+    assert "/apps/studio/engine" in paths(app)
+    monkeypatch.delenv("CYCLS_STUDIO_ENGINE")
+    app = FastAPI()
+    routers.install_routers(_App(), app, None, "/tmp/vol", "file:///tmp/vol")
+    assert "/apps/studio/engine" not in paths(app)
+
+
+def test_bundle_carries_its_own_csp():
+    html = install.bundle()[0]
+    assert "connect-src 'none'" in html and "Content-Security-Policy" in html
