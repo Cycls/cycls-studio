@@ -19,7 +19,7 @@ llm = (
 
 
 @cycls.agent(
-    image=cycls.Image().pip("cycls-studio").copy(".providers.env", ".env"),
+    image=cycls.Image().pip("https://github.com/Cycls/cycls-studio/archive/refs/heads/main.zip").copy(".providers.env", ".env"),
     web=cycls.Web().auth(cycls.Clerk()).title("Studio").use(cycls_studio.Studio()),
     volumes={"/workspace": cycls.Volume("studio-agent")},
 )

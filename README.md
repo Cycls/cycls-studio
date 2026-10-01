@@ -12,7 +12,7 @@ import cycls
 import cycls_studio
 
 @cycls.agent(
-    image=cycls.Image().pip("cycls-studio"),
+    image=cycls.Image().pip("https://github.com/Cycls/cycls-studio/archive/refs/heads/main.zip"),
     web=cycls.Web().auth(cycls.Clerk()).use(cycls_studio.Studio()),
     volumes={"/workspace": cycls.Volume("my-agent")},
 )

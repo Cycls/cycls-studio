@@ -415,7 +415,7 @@ cd app && npm run build
 ```
 
 An agent adds the Studio with `cycls.Web().use(cycls_studio.Studio())`, the package in its image
-(`cycls.Image().pip("cycls-studio")`) and the env `CYCLS_STUDIO_ENGINE=cycls-render` plus
+(`cycls.Image().pip("https://github.com/Cycls/cycls-studio/archive/refs/heads/main.zip")`) and the env `CYCLS_STUDIO_ENGINE=cycls-render` plus
 `CYCLS_API_KEY`. The person can switch it off in Settings like a builtin. `CYCLS_STUDIO_RENDERER` optionally sends `render` to a separate deployment so
 long renders don't queue in front of interactive ops. `cycls.remote` needs matching Python and
 cloudpickle on both sides.
