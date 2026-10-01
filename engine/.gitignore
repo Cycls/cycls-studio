@@ -1,0 +1,5 @@
+out/
+__pycache__/
+.pytest_cache/
+spikes/*/node_modules/
+spikes/*/dist/

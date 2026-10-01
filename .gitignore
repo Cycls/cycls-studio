@@ -11,3 +11,4 @@ app/dev/shots/
 app/dev/host.js
 engine/out/
 uv.lock
+app/dev/.chrome/
