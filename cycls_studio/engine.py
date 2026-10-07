@@ -1,14 +1,18 @@
 """The Blender engine, called by name with cycls.remote. The engine is stateless:
 the scene document and the mesh files it references go up with every call, and
-bytes come back in the reply (never a pickle built from Blender's output)."""
+bytes come back in the reply (never a pickle built from Blender's output).
+
+A renderer named by URL (CYCLS_STUDIO_RENDERER=https://…) is not a Cycls deployment: the GPU
+host in engine/modal_fn.py, called over HTTPS with wire.py's frames."""
 import asyncio
 import gzip
 import hashlib
+import os
 import pathlib
 
 from cycls.extension import api_key
 
-from . import engine_name, renderer_name
+from . import engine_name, renderer_name, wire
 
 TIMEOUTS = {"evaluate": 90, "apply": 150, "snapshot": 150, "render": 660, "export": 210,
             "script": 150, "import": 330, "selftest": 150, "ping": 60, "texture": 90,
@@ -24,6 +28,32 @@ CACHEABLE = ("meshes/", "textures/")     # named by their content: the engine ma
 
 class EngineError(Exception):
     """The engine refused or failed; the message is written for the model/user."""
+
+
+def host(op):
+    """Where an op runs: the engine, or the renderer for the long ones when there is one. A
+    renderer named by URL is a GPU host that runs Blender bare, so it gets render and video and
+    not the join: `encode` decodes workspace files, which wants the engine's sandbox."""
+    r = renderer_name()
+    if op in LONG_OPS and not (op == "encode" and str(r).startswith("http")):
+        return r
+    return engine_name()
+
+
+def _post(url, timeout, meta, blobs):
+    """One call to a renderer by URL: a frame each way, behind its key (CYCLS_STUDIO_RENDERER_KEY,
+    as a bearer token). A reply slower than Modal's 150 s comes as a redirect to it, so redirects
+    are followed."""
+    import httpx
+    r = httpx.post(url, content=wire.encode(meta, blobs), timeout=timeout, follow_redirects=True,
+                   headers={"Content-Type": "application/octet-stream",
+                            "Authorization": "Bearer " + os.environ.get("CYCLS_STUDIO_RENDERER_KEY", "")})
+    if r.status_code in (429, 503):
+        raise EngineError("the Studio engine is busy — try again in a minute")
+    if r.status_code != 200:
+        raise EngineError(f"the Studio renderer is unavailable ({r.status_code} {r.text[:200]})")
+    meta, files = wire.decode(r.content)
+    return {**meta, "files": files}
 
 
 def pack(blobs):
@@ -56,7 +86,7 @@ async def call(op, scene, *, blobs=None, params=None, ws=None):
     """One engine op. With `ws`, the mesh and image files go by name first: the engine keeps
     what it has been sent (per workspace), answers with what it's missing, and only those
     follow — a snapshot after a lighting change sends none of a big scene's meshes."""
-    name = renderer_name() if op in LONG_OPS else engine_name()
+    name = host(op)
     if not name:
         raise EngineError("Studio isn't configured (CYCLS_STUDIO_ENGINE)")
     blobs = blobs or {}
@@ -82,10 +112,17 @@ async def _send(name, op, scene, blobs, params, extra=None):
     # A 100 MB scene takes minutes just to go up from a slow uplink (a laptop running the
     # agent): the timeout grows with what's sent, ~4 s a megabyte.
     up = sum(len(v) for v in packed.values())
-    fn = cycls.remote(name, timeout=TIMEOUTS.get(op, 120) + up // 250_000, sticky=True)
+    timeout = TIMEOUTS.get(op, 120) + up // 250_000
     try:
-        r = await asyncio.to_thread(fn, op=op, scene=scene, blobs=packed, params=params or {}, gzip=True,
-                                    **(extra or {}))
+        if name.startswith("http"):
+            r = await asyncio.to_thread(_post, name, timeout, {"op": op, "scene": scene, "params": params or {},
+                                                               "gzip": True, **(extra or {})}, packed)
+        else:
+            fn = cycls.remote(name, timeout=timeout, sticky=True)
+            r = await asyncio.to_thread(fn, op=op, scene=scene, blobs=packed, params=params or {}, gzip=True,
+                                        **(extra or {}))
+    except EngineError:
+        raise
     except RemoteError as e:
         if getattr(e, "status", None) in (429, 503):
             raise EngineError("the Studio engine is busy — try again in a minute") from None

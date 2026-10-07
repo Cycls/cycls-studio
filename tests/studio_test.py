@@ -369,6 +369,49 @@ class TestEngine:
         monkeypatch.setattr("cycls._function.main._get_api_key", lambda: "k2")
         assert E.cache_key(t.SimpleNamespace(root=str(root))) != a                          # another key, another shelf
 
+    def test_a_renderer_by_url_gets_render_as_frames_and_the_rest_stays_on_the_engine(self, root, engine, monkeypatch):
+        import httpx
+        from cycls_studio import engine as E, wire
+        monkeypatch.setenv("CYCLS_STUDIO_RENDERER", "https://ws--cycls-studio-renderer-web.modal.run")
+        monkeypatch.setenv("CYCLS_STUDIO_RENDERER_KEY", "k-1")
+        posts = []
+
+        def post(url, **kw):                                       # the GPU host, as engine/modal_fn.py answers
+            meta, blobs = wire.decode(kw["content"])
+            posts.append({"url": url, **kw, **meta, "blobs": blobs})
+            return httpx.Response(200, content=wire.encode(
+                {"ok": True, "result": {"png": "render.png", "preview": "preview.jpg", "render_seconds": 2.5,
+                                        "resolution": [1280, 720], "samples": 32, "device": "OPTIX"}},
+                {"render.png": PNG, "preview.jpg": JPG}))
+        monkeypatch.setattr(httpx, "post", post)
+        n = len(engine.calls)
+        run({"action": "render", "name": "gpu"}, root)
+        assert (root / "renders/gpu.png").read_bytes() == PNG and len(posts) == 1 and len(engine.calls) == n
+        p = posts[0]
+        assert p["op"] == "render" and p["gzip"] is True and p["follow_redirects"] is True   # a slow reply is a redirect
+        assert p["headers"]["Authorization"] == "Bearer k-1"
+        assert "cube" in p["scene"]["objects"] and len(p["cache"]) == 32                       # the document; files by name
+        run({"action": "snapshot"}, root)
+        assert engine.calls[-1]["op"] == "snapshot" and len(posts) == 1                        # interactive: the engine
+        assert E.host("video") == p["url"] and E.host("encode") == "cycls-render"              # the join wants the sandbox
+
+    def test_a_renderer_by_url_that_is_busy_or_refuses_says_so(self, root, engine, monkeypatch):
+        import httpx
+        monkeypatch.setenv("CYCLS_STUDIO_RENDERER", "https://ws--cycls-studio-renderer-web.modal.run")
+        monkeypatch.setattr(httpx, "post", lambda url, **kw: httpx.Response(503, text="no capacity"))
+        assert run({"action": "render"}, root) == "Error: the Studio engine is busy — try again in a minute"
+        monkeypatch.setattr(httpx, "post", lambda url, **kw: httpx.Response(401))
+        assert run({"action": "render"}, root).startswith("Error: the Studio renderer is unavailable (401")
+
+    def test_a_frame_is_json_and_bytes_and_anything_else_is_refused(self):
+        from cycls_studio import wire
+        frame = wire.encode({"op": "render", "params": {"samples": 8}}, {"render.png": PNG, "note": "text"})
+        assert wire.decode(frame) == ({"op": "render", "params": {"samples": 8}}, {"render.png": PNG, "note": b"text"})
+        assert wire.decode(wire.encode({})) == ({}, {})
+        for bad in (b"", b"\x80\x04pickle", frame[:-1], frame + b"!", frame[:4] + b"\xff\xff\xff\xff" + frame[8:]):
+            with pytest.raises(ValueError):
+                wire.decode(bad)
+
     def test_snapshot_sends_the_scene_and_returns_the_image(self, root, engine):
         out = run({"action": "snapshot"}, root)
         call = engine.calls[-1]

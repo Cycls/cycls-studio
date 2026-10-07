@@ -24,6 +24,7 @@ bpy" option safe to add: there's nothing on this box to steal.
 | `worker.py` | The warm Blender worker for Studio ops: jobs in on stdin as job directories, answers on a dedicated fd, recycled after 100 jobs and after any `script`/`import`. |
 | `studio_bpy.py` | Studio's Blender side: the scene document to bpy and back, and the ops (`evaluate`, `apply`, `snapshot`, `render`, `export`, `script`, `import`, `selftest`). |
 | `studio_try.py` | Studio's dev loop: `PYTHONPATH=.. python studio_try.py dev apply …` runs the current code on a cloud executor, `remote` the deployment. |
+| `modal_fn.py` | The GPU renderer: the same worker on a Modal GPU, for `render` and `video` only (`modal deploy modal_fn.py`). See "A GPU renderer" in `docs/studio.md`. |
 | `spikes/` | Phase-0 spikes and `FINDINGS.md` (WebGL in the sandboxed frame, the warm worker, fidelity). |
 
 ## Studio ops

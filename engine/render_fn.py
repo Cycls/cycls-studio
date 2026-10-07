@@ -5,13 +5,17 @@
 #                                           on a scene document (see studio_bpy.py)
 #
 #   cd engine && uv run cycls deploy render_fn.py      (captures ../cycls_studio/scene.py)
+#   modal deploy engine/modal_fn.py                    the same worker on a GPU, for render and video
 #   python -c 'import cycls; r = cycls.remote("cycls-render")({"object": "torus", "material": "gold"})'
 #
 # The box is deliberately stateless — no volume, no secrets. It returns bytes;
 # the caller decides where they live. See README.md.
 from pathlib import Path
 
-import cycls
+try:
+    import cycls
+except ImportError:                  # the GPU renderer (modal_fn.py) imports this file for _studio; no SDK there
+    cycls = None
 
 BLENDER = "5.2.2"                    # current LTS line; bump deliberately
 _TARBALL = (f"https://download.blender.org/release/Blender{BLENDER.rsplit('.', 1)[0]}/"
@@ -36,7 +40,7 @@ def _scene_source():
 
 SCENE_SRC = _scene_source()
 
-image = (
+image = cycls and (
     cycls.Image()
     # X/GL client libs Blender links against even in background mode; bubblewrap +
     # util-linux (unshare) sandbox the Studio worker.
@@ -207,14 +211,21 @@ def _wrap(mode, inner):
     return inner
 
 
+def _gpu():
+    """This host renders on a GPU (CYCLS_STUDIO_DEVICE=gpu — the renderer in modal_fn.py)."""
+    import os
+    return os.environ.get("CYCLS_STUDIO_DEVICE", "").lower() == "gpu"
+
+
 def _sandbox_mode():
-    """The strongest isolation this runtime allows, probed once per process."""
+    """The strongest isolation this runtime allows, probed once per process. A GPU host runs bare:
+    bwrap's own /dev has no GPU in it, and it takes only render and video — nothing tainted."""
     import subprocess
     import sys
     mode = getattr(sys, "_cycls_sandbox", None)
     if mode is None:
         mode = "none"
-        for m in ("unshare", "bwrap"):
+        for m in () if _gpu() else ("unshare", "bwrap"):
             try:
                 if subprocess.run(_wrap(m, ["--", "true"]), capture_output=True, timeout=20).returncode == 0:
                     mode = m
@@ -452,7 +463,8 @@ def _studio(op, scene, blobs, params, gz=False, cache=None, refs=None):
                     shutil.copyfile(path, os.path.join(jobdir, name))
                 inputs.add(name)
             with open(jobdir + "/in.json", "w") as f:
-                json.dump({"op": op, "scene": scene, "params": params or {}}, f)
+                json.dump({"op": op, "scene": scene, "params": params or {},
+                           "device": "gpu" if _gpu() else "cpu"}, f)
             t = time.monotonic()
             st["proc"].stdin.write(f"run {jobdir}\n".encode())
             st["proc"].stdin.flush()
@@ -508,8 +520,6 @@ def _studio(op, scene, blobs, params, gz=False, cache=None, refs=None):
                 _cache_trim()
 
 
-@cycls.function(name="cycls-render", image=image, cpu=8, memory="8Gi",
-                timeout=900, concurrency=1)
 def render(config: dict = None, *, op: str = None, scene: dict = None, blobs: dict = None,
            params: dict = None, gzip: bool = False, cache: str = None, refs: list = None) -> dict:
     """Legacy: render(config) → {"ok", "png", "preview", "glb", …}.
@@ -523,4 +533,7 @@ def render(config: dict = None, *, op: str = None, scene: dict = None, blobs: di
         return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:500]}"}
 
 
-render.spec["max_instances"] = 4     # cost ceiling; the decorator doesn't expose it
+if cycls:
+    render = cycls.function(name="cycls-render", image=image, cpu=8, memory="8Gi",
+                            timeout=900, concurrency=1)(render)
+    render.spec["max_instances"] = 4     # cost ceiling; the decorator doesn't expose it

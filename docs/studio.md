@@ -438,6 +438,30 @@ An agent adds the Studio with `cycls.Web().use(cycls_studio.Studio())`, the pack
 long renders don't queue in front of interactive ops. `cycls.remote` needs matching Python and
 cloudpickle on both sides.
 
+**A GPU renderer.** `CYCLS_STUDIO_RENDERER` may be a URL instead of a deployment's name: the
+renderer in `engine/modal_fn.py`, the same warm worker on a Modal GPU (`modal deploy
+engine/modal_fn.py`, after `modal secret create cycls-studio-renderer
+CYCLS_STUDIO_RENDERER_KEY=…`; the agent holds the same key in `CYCLS_STUDIO_RENDERER_KEY`). It
+takes `render` and `video`; everything interactive, and the `encode` that joins a video (it
+decodes workspace files, which wants the engine's sandbox), stays on the engine next to the
+agent. Measured on an L4 with OptiX against the 8-core engine, same scene: 1280×720 at 32
+samples 1.7 s against 22.5 s (3.6 s on a container's first render), 1920×1080 at 128 samples
+4.7 s against 111 s, video at 720p and 16 samples 0.6 s a frame against 12.3 s.
+
+- **The call.** Not `cycls.remote`: `engine.py` posts `wire.py`'s frame — a JSON header and the
+  raw files, never a pickle — with the key as a bearer token, and follows redirects (Modal
+  answers a request slower than 150 s with one).
+- **Two functions.** `web` is the door, a small CPU container that checks the key and hands the
+  frame to `gpu`, which has no URL: a stranger who finds the address wakes the door and never a
+  GPU. Modal's own proxy auth would do the same at its edge; its tokens are made by hand in the
+  dashboard, and this key is made by the deploy.
+- **Bare Blender.** bwrap's own `/dev` has no GPU in it, so on a GPU host
+  (`CYCLS_STUDIO_DEVICE=gpu`) the worker runs unsandboxed — which is why it accepts nothing
+  tainted. The job says `device: gpu`; Blender switches Cycles' OptiX devices on (CUDA where the
+  driver has no OptiX, the CPU where there is no GPU) and each answer says which it used.
+- **Cost.** A GPU container idles five minutes after its last render and then goes;
+  `max_containers` (2) is the ceiling. A cold one answers its first call in about 12 s.
+
 **Importing a .blend.** The file's first scene comes in as it shows it: what its view layer
 excludes or its collections hide stays hidden (often the prototypes of instances), and an
 instancer Blender doesn't draw itself — a particle emitter, a duplicator — comes in hidden

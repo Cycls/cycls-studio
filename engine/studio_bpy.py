@@ -566,7 +566,34 @@ def _animate(doc, objs):
     return keyed
 
 
-def _render_settings(doc, resolution, samples, png):
+_GPU = {}
+
+
+def _gpu_kind():
+    """Cycles' GPU devices switched on, once a worker: OptiX where the driver has it, else CUDA.
+    The kind now in use, or None — no GPU here, and the render goes to the CPU."""
+    if "kind" not in _GPU:
+        _GPU["kind"] = None
+        with contextlib.suppress(Exception):
+            prefs = bpy.context.preferences.addons["cycles"].preferences
+            for kind in ("OPTIX", "CUDA"):
+                with contextlib.suppress(Exception):
+                    prefs.compute_device_type = kind
+                    (getattr(prefs, "refresh_devices", None) or prefs.get_devices)()
+                    if any(d.type == kind for d in prefs.devices):
+                        for d in prefs.devices:
+                            d.use = d.type == kind
+                        _GPU["kind"] = kind
+                        break
+    return _GPU["kind"]
+
+
+def _device():
+    """What the scene as set up renders on: OPTIX, CUDA or CPU."""
+    return (_GPU.get("kind") if bpy.context.scene.cycles.device == "GPU" else None) or "CPU"
+
+
+def _render_settings(doc, resolution, samples, png, device="cpu"):
     scene = bpy.context.scene
     r = scene.render
     r.engine = "CYCLES"
@@ -578,10 +605,11 @@ def _render_settings(doc, resolution, samples, png):
     r.image_settings.compression = 40
     r.filepath = png
     cy = scene.cycles
-    cy.device = "CPU"
+    cy.device = "GPU" if device == "gpu" and _gpu_kind() else "CPU"      # a GPU host says so in the job
     cy.samples = samples
     cy.use_adaptive_sampling = True
     for attr, val in (("use_denoising", doc["render"]["denoise"]), ("denoiser", "OPENIMAGEDENOISE"),
+                      ("denoising_use_gpu", cy.device == "GPU"),
                       ("max_bounces", 10), ("glossy_bounces", 6), ("transmission_bounces", 10),
                       ("caustics_reflective", False), ("caustics_refractive", False),
                       ("sample_clamp_indirect", 8.0)):
@@ -1217,7 +1245,7 @@ def _render_to(job, jobdir, resolution, samples):
     if isinstance(frame, int) and 0 <= frame <= S.MAX_FRAME:      # an animation's pose there
         bpy.context.scene.frame_set(frame)
     png = os.path.join(jobdir, "render.png")
-    _render_settings(doc, resolution, samples, png)
+    _render_settings(doc, resolution, samples, png, job.get("device"))
     t = time.perf_counter()
     bpy.ops.render.render(write_still=True)
     secs = time.perf_counter() - t
@@ -1234,7 +1262,7 @@ def op_snapshot(job, jobdir):
     k = 640 / max(w, h)
     res = [max(16, int(w * k)), max(16, int(h * k))] if k < 1 else [w, h]
     secs = _render_to(job, jobdir, res, samples)
-    return {"preview": "preview.jpg", "render_seconds": secs, "resolution": res}
+    return {"preview": "preview.jpg", "render_seconds": secs, "resolution": res, "device": _device()}
 
 
 def op_render(job, jobdir):
@@ -1246,7 +1274,7 @@ def op_render(job, jobdir):
         raise ValueError("resolution/samples over the caps (1920x1080 pixels, 256 samples)")
     secs = _render_to(job, jobdir, res, samples)
     return {"png": "render.png", "preview": "preview.jpg", "render_seconds": secs,
-            "resolution": list(res), "samples": samples}
+            "resolution": list(res), "samples": samples, "device": _device()}
 
 
 VIDEO_MAX_PIXELS = 1280 * 720
@@ -1341,7 +1369,7 @@ def op_video(job, jobdir):
     scene.camera = objs[cam]
     frames = os.path.join(jobdir, "frames")
     os.makedirs(frames)
-    _render_settings(doc, [w, h], samples, os.path.join(frames, "f-######"))
+    _render_settings(doc, [w, h], samples, os.path.join(frames, "f-######"), job.get("device"))
     r = scene.render
     r.film_transparent = False                     # an mp4 has no alpha
     r.image_settings.color_mode = "RGB"
@@ -1358,7 +1386,8 @@ def op_video(job, jobdir):
     if not all(os.path.exists(x) for x in pngs):
         raise RuntimeError("Blender didn't write every frame")
     out = {"segment": "segment.mp4", "frames": [a, b], "render_seconds": round(secs, 2),
-           "seconds_per_frame": round(secs / (b - a + 1), 3), "resolution": [w, h], "samples": samples}
+           "seconds_per_frame": round(secs / (b - a + 1), 3), "resolution": [w, h], "samples": samples,
+           "device": _device()}
     if p.get("poster"):
         _preview(pngs[0], os.path.join(jobdir, "poster.jpg"), longest=1280)
         out["poster"] = "poster.jpg"
