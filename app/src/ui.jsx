@@ -395,11 +395,14 @@ function ModifiersPanel({ s, a, id }) {
         <ObjectPick s={s} value={m.type === "boolean" ? m.object : m.mirror_object} filter={(k, x) => k !== id && x.type === "mesh"}
           onChange={(v) => setMods((ms) => { ms[i][m.type === "boolean" ? "object" : "mirror_object"] = v; }, "modifier object")} /></label>}
     </div>)}
-    <label class="row"><span>Add</span><select value="" onChange={(e) => {
-      const t = e.currentTarget.value;
-      if (t === "boolean") { a.toast("Pick the cutter object in the boolean's Cutter field"); }
-      if (t) setMods((ms) => { ms.push(make.modifier(t)); }, `add ${t}`);
-    }}><option value="">+ Modifier…</option>{Object.keys(SCHEMA.modifiers).map((t) => <option key={t} value={t}>{label(t)}</option>)}</select></label>
+    {/* A menu, not a <select>: a select answers every key typed at it with a change, and each change
+        added a modifier — typing "Subsurf" made seven, six of them subdivisions. */}
+    <div class="row"><span>Add</span><Menu label="+ Modifier…" align="right up"
+      items={Object.keys(SCHEMA.modifiers).map((t) => ({ id: t, label: label(t) }))}
+      onPick={(t) => {
+        if (t === "boolean") { a.toast("Pick the cutter object in the boolean's Cutter field"); }
+        setMods((ms) => { ms.push(make.modifier(t)); }, `add ${t}`);
+      }} /></div>
   </Section>;
 }
 

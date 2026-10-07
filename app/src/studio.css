@@ -34,6 +34,8 @@ input[type=checkbox] { accent-color: var(--blue); }
 .menu-pop { position: absolute; top: 100%; left: 0; z-index: 30; background: #262626; border: 1px solid var(--line);
   border-radius: 6px; padding: 4px; min-width: 170px; box-shadow: 0 8px 24px #000a; max-height: 70vh; overflow: auto; }
 .menu-pop.right { left: auto; right: 0; }
+.menu-pop.up { top: auto; bottom: 100%; }
+.row > .menu > button { width: 100%; text-align: left; }
 .menu-pop button { display: block; width: 100%; text-align: left; border: 0; background: transparent; }
 .menu-pop button:hover { background: var(--blue); color: #fff; }
 .menu-pop hr { border: 0; border-top: 1px solid #3a3a3a; margin: 4px 0; }
