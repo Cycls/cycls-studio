@@ -37,6 +37,16 @@ What the agent needs besides:
 - A `cycls` with the extension hook (`cycls.Extension`, `Web().use`): the SDK's
   `feat/agent-design-extensions` branch until it reaches main (it carries the Design tool as
   well). An agent built on another SDK branch can't `.use()` anything.
+- In a uv project, the SDK named the way this package names it: by that branch, not by a commit.
+  This package's own `pyproject.toml` asks for `cycls` by branch, and a commit that isn't the
+  branch's head stops `uv lock` with "conflicting URLs for package `cycls`" (so a commit pin
+  breaks the day the branch moves). `uv lock --upgrade-package cycls` takes a newer SDK.
+
+  ```toml
+  [tool.uv.sources]
+  cycls = { git = "https://github.com/Cycls/cycls", branch = "feat/agent-design-extensions" }
+  cycls-studio = { git = "https://github.com/Cycls/cycls-studio", rev = "<sha>" }  # the commit the image installs
+  ```
 - Python 3.12, as the engine runs: a call to it needs the same Python on both sides.
 - `.auth(...)` on its `Web`, and a workspace volume: the Studio installs its app into each workspace.
 - To pick up a change here, a new image: pin the package by commit
