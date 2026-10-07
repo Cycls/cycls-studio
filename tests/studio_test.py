@@ -522,6 +522,10 @@ class TestRoute:
         assert r.json()["preview"].startswith("data:image/jpeg;base64,")
         assert "unsaved" in engine.calls[-1]["scene"]["objects"]
 
+    def test_a_snapshots_samples_arent_the_apps_to_raise(self, client, engine):
+        client.post("/apps/studio/engine", json={"op": "snapshot", "params": {"samples": 256, "frame": 7}})
+        assert engine.calls[-1]["params"] == {"frame": 7}         # more samples is a render, with a render's budget
+
     def test_render_is_saved_before_the_answer(self, client, root):
         r = client.post("/apps/studio/engine", json={"op": "render", "name": "Hero"}).json()
         assert r["path"] == "renders/hero.png" and (root / "renders/hero.png").read_bytes() == PNG

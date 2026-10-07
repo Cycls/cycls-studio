@@ -596,6 +596,56 @@ class TestBigScenes:
         doc["objects"]["o0"]["location"] = [0, 0, 50]                 # floating — but not worth 25M comparisons
         assert S.layout_check(doc) == []
 
+    def test_the_venues_shared_meshes_weigh_once(self):
+        doc = _venue()
+        meshes = {o["mesh"] for o in doc["objects"].values() if o["type"] == "mesh"}
+        assert S.heft(doc)[0] == sum(S.mesh_faces(doc["meshes"][m]) for m in meshes) < S.MAX_FACES
+
+
+# ─── how heavy a scene gets once its modifiers run ──────────────────────────
+
+class TestHeft:
+    @staticmethod
+    def _monkey(*mods):
+        doc, _ = S.apply_ops(S.new_scene(), [
+            {"op": "add", "id": "monkey", "primitive": "monkey"},
+            *[{"op": "modifier", "object": "monkey", "type": t, "params": p} for t, p in mods]])
+        return doc
+
+    @pytest.mark.parametrize("mesh, faces", [
+        ({"primitive": "cube"}, 6), ({"primitive": "uv_sphere"}, 512), ({"primitive": "ico_sphere"}, 80),
+        ({"primitive": "cylinder"}, 34), ({"primitive": "grid"}, 100), ({"primitive": "torus"}, 576),
+        ({"primitive": "monkey"}, 500), ({"primitive": "circle", "fill": "none"}, 0), ({"primitive": "plane"}, 1)])
+    def test_a_primitive_has_blenders_face_count(self, mesh, faces):
+        # the counts Blender's own primitives came out at (engine/spikes/FINDINGS.md, S3)
+        doc = S.normalize({"objects": {"x": {"type": "mesh", "mesh": "m"}}, "meshes": {"m": mesh}})
+        assert S.mesh_faces(doc["meshes"]["m"]) == faces
+
+    def test_six_stacked_subdivisions_are_billions_of_faces(self):
+        # what the Add Modifier dropdown once made of typing "Subsurf": it took an engine instance down
+        doc = self._monkey(*[("subsurf", {})] * 6)
+        assert S.heft(doc) == (500 * 4 ** 6 + 6, "monkey", 500 * 4 ** 6)             # the viewport's level 1, and the cube
+        assert S.heft(doc, render=True)[2] == 500 * 4 ** 12 > 8_000_000_000          # a render's level 2
+        assert S.heft(self._monkey(("subsurf", {})), render=True)[0] < S.MAX_FACES   # one is a few thousand
+
+    def test_what_multiplies_counts_and_the_fattest_point_is_kept(self):
+        grown = lambda *mods: S.heft(self._monkey(*mods), ids=["monkey"])[2]         # noqa: E731
+        assert grown(("array", {"count": 7})) == 3500
+        assert grown(("mirror", {"axis": [True, True, False]})) == 2000
+        assert grown(("bevel", {}), ("solidify", {})) == 500                         # they add faces: left out
+        assert grown(("subsurf", {"levels": 3}), ("decimate", {"ratio": 0.1})) == 32_000
+        assert grown(("decimate", {"ratio": 0.1}), ("subsurf", {"levels": 3})) == 3200
+        # a voxel remesh is the object's surface in voxels: the monkey's box, 2.74 x 1.7 x 1.96 m, at 1 cm
+        assert grown(("remesh", {"voxel_size": 0.01})) == pytest.approx(2 * (2.74 * 1.7 + 1.7 * 1.96 + 1.96 * 2.74) / 1e-4)
+
+    def test_a_hidden_modifier_or_object_weighs_nothing_extra(self):
+        doc = self._monkey(("subsurf", {"levels": 4}))
+        doc["objects"]["monkey"]["modifiers"][0]["show"] = False
+        assert S.heft(doc, ids=["monkey"])[2] == 500
+        doc = self._monkey(("subsurf", {"render_levels": 5}))
+        doc["objects"]["monkey"]["renderable"] = False
+        assert S.heft(doc, render=True) == (6, "cube", 6)                             # only what renders
+
 
 # ─── diff / merge ───────────────────────────────────────────────────────────
 

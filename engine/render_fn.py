@@ -117,6 +117,15 @@ OP_TIMEOUT = {"ping": 30, "evaluate": 60, "apply": 120, "snapshot": 120, "render
 # Untrusted input — code, a model, an image, video segments from the workspace: a fresh worker each.
 TAINTED = {"script", "import", "texture", "encode"}
 RECYCLE_JOBS = 100          # a warm worker this old starts over: whatever Blender leaked goes with it
+# Blender's own chatter, read only for a failed boot's message. /tmp is memory, so each worker
+# starts it over and it's emptied past LOG_MAX — and a tainted worker, which can read its stdout
+# back, never finds another job's output in it.
+LOG = ROOT + "/blender.log"
+LOG_MAX = 4_000_000
+# Blender's share of the instance's 8 GiB (the file cache and this process have the rest). A job
+# past it is stopped while there is still an instance to answer with: one that runs the box out
+# of memory takes its reply, and the timeout that would have ended it, down too.
+MEM_MAX = 5 * 2**30
 MAX_IN = 110_000_000        # the SDK sends at most 100 MB of meshes + images, plus the scene
 MAX_OUT = 160_000_000       # an import's meshes come back as base64 sidecars, a third bigger
 _BLOB_NAME = (r"^(meshes/m-[0-9a-f]{12}\.json|textures/t-[0-9a-f]{12}\.(png|jpg)"
@@ -216,7 +225,47 @@ def _sandbox_mode():
     return mode
 
 
-def _readline(st, timeout):
+def _trim_log():
+    """Empty the log once it's past LOG_MAX. A running worker appends to it (O_APPEND), so its
+    next line lands at the start."""
+    import os
+    try:
+        if os.path.getsize(LOG) > LOG_MAX:
+            os.truncate(LOG, 0)
+    except OSError:
+        pass
+
+
+def _rss(root):
+    """Resident bytes of process `root` and everything under it (the sandbox's Blender is its
+    grandchild), from /proc; 0 where that can't say."""
+    import os
+    kids, pages = {}, {}
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return 0
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/stat") as f:
+                rest = f.read().rsplit(")", 1)[1].split()      # past the name, which may hold spaces
+            kids.setdefault(int(rest[1]), []).append(int(name))
+            pages[int(name)] = int(rest[21])
+        except (OSError, IndexError, ValueError):
+            continue                                            # gone between the listing and the read
+    total, todo = 0, [root]
+    while todo:
+        pid = todo.pop()
+        total += pages.get(pid, 0)
+        todo += kids.get(pid, [])
+    return total * os.sysconf("SC_PAGE_SIZE")
+
+
+def _readline(st, timeout, stop=None):
+    """The worker's next line: None if `timeout` passes first — or `stop()`, asked four times a
+    second, says to give up — and "" if its end of the pipe closed: the worker is gone."""
     import os
     import select
     import time
@@ -225,14 +274,24 @@ def _readline(st, timeout):
         left = end - time.monotonic()
         if left <= 0:
             return None
-        ready, _, _ = select.select([st["r"]], [], [], left)
+        ready, _, _ = select.select([st["r"]], [], [], min(left, 0.25) if stop else left)
         if ready:
             chunk = os.read(st["r"], 4096)
             if not chunk:
-                return None
+                return ""
             st["buf"] += chunk
+        elif stop and stop():
+            return None
     line, _, st["buf"] = st["buf"].partition(b"\n")
     return line.decode()
+
+
+def _exit_code(st):
+    """A dead worker's exit status: 128 + the signal through bwrap, minus the signal without it."""
+    try:
+        return st["proc"].wait(timeout=5)
+    except Exception:
+        return None
 
 
 def _kill(st):
@@ -275,7 +334,8 @@ def _spawn(st, mode, key, bind=JOBS_ROOT):
                "-P", wdir + "/worker.py", "--", "--resp-fd", str(w)]
     argv = blender if mode == "none" else _wrap(mode, ["--ro-bind", wdir, wdir, "--bind", bind, bind,
                                                       "--", *blender])
-    log = open(ROOT + "/blender.log", "ab")
+    log = open(LOG, "ab")
+    log.truncate(0)
     t = time.monotonic()
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=log, stderr=log, pass_fds=(w,),
                             start_new_session=True)
@@ -283,7 +343,7 @@ def _spawn(st, mode, key, bind=JOBS_ROOT):
     st.update(proc=proc, r=r, buf=b"", key=key, mode=mode, jobs=0, boot_s=None)
     line = _readline(st, 120)
     if not line or not line.startswith("ready"):
-        with open(ROOT + "/blender.log", "rb") as f:
+        with open(LOG, "rb") as f:
             tail = f.read()[-1500:].decode(errors="replace")
         _kill(st)
         raise RuntimeError(f"Studio engine failed to start: {tail[-600:]}")
@@ -359,6 +419,7 @@ def _studio(op, scene, blobs, params, gz=False, cache=None, refs=None):
         st = sys._cycls_blender = {"lock": threading.Lock(), "proc": None, "r": None, "buf": b""}
     with st["lock"]:
         spawned = False
+        _trim_log()
         os.makedirs(JOBS_ROOT, exist_ok=True)
         os.chmod(JOBS_ROOT, 0o777)
         jobdir = tempfile.mkdtemp(dir=JOBS_ROOT)
@@ -395,10 +456,24 @@ def _studio(op, scene, blobs, params, gz=False, cache=None, refs=None):
             t = time.monotonic()
             st["proc"].stdin.write(f"run {jobdir}\n".encode())
             st["proc"].stdin.flush()
-            line = _readline(st, OP_TIMEOUT[op])
+            pid, peak = st["proc"].pid, [0]
+
+            def heavy():                       # Blender is past its share of the instance's memory
+                peak[0] = max(peak[0], _rss(pid))
+                return peak[0] > MEM_MAX
+            line = _readline(st, OP_TIMEOUT[op], stop=heavy)
             if line is None:
                 _kill(st)
+                if peak[0] > MEM_MAX:
+                    return {"ok": False, "error": f"{op} ran out of memory ({peak[0] / 2**30:.1f} GB and growing) — "
+                                                  "stopped. The scene is too heavy for the engine: lower the "
+                                                  "subdivision levels, or use a coarser remesh or fewer copies"}
                 return {"ok": False, "error": f"{op} took longer than {OP_TIMEOUT[op]}s — stopped"}
+            if not line:                       # no answer and no worker: Blender died mid-job
+                code = _exit_code(st)
+                _kill(st)
+                return {"ok": False, "error": f"Blender crashed during {op}"
+                                              + ("" if code is None else f" (exit {code})")}
             st["jobs"] += 1
             with open(jobdir + "/out.json") as f:
                 out = json.load(f)
@@ -420,7 +495,8 @@ def _studio(op, scene, blobs, params, gz=False, cache=None, refs=None):
                             rel, data = rel + ".gz", z
                     files[rel] = data
             meta = {"seconds": round(time.monotonic() - t, 3), "spawned": spawned,
-                    "boot_s": st.get("boot_s") if spawned else None, "sandbox": mode, "jobs": st["jobs"]}
+                    "boot_s": st.get("boot_s") if spawned else None, "sandbox": mode, "jobs": st["jobs"],
+                    "mem_mb": max(peak[0], _rss(pid)) >> 20}       # Blender's most, as far as it was sampled
             if line.split()[-1] != "ok":
                 return {"ok": False, "error": out.get("error", "failed"), "trace": out.get("trace"), **meta}
             return {"ok": True, "op": op, "result": out, "files": files, **meta}

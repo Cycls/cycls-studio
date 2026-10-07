@@ -121,7 +121,7 @@ both come out right.
 |---|---|---|
 | `evaluate` | app, agent | display meshes after modifiers (per-loop positions/normals, triangles) |
 | `apply` | app, agent | `modifier_apply {index}`, `convert`, `join {others}`, `remesh`, `decimate`, `boolean`, and on a selection: `bevel`, `inset`, `subdivide`, `triangulate`, `merge_by_distance`, `recalc_normals`, `uv {method: cube\|cylinder\|sphere\|reset}`, `assign {slot}` (faces → a material slot), `connect {verts}` (an edge between two vertices, splitting the faces between them), `bisect {plane_co, plane_no, clear_inner?, clear_outer?, fill?}` (a plane in the object's space cuts all the way through; one side can go and the hole be filled); a join answers with the merged slots |
-| `snapshot` | app, agent | ~640×360, few samples, ~5 s — for checking work; `frame` poses an animation there |
+| `snapshot` | app, agent | ~640×360, few samples (12 unless asked, at most 256), ~5 s — for checking work; `frame` poses an animation there |
 | `render` | app, agent | the Cycles render, PBR Neutral, denoised |
 | `video` | route | frames `[a, b]` (≤ 120) as an H.264 segment, and the first frame as a poster when asked — see Video |
 | `encode` | route | `segments/s-000.mp4 …` joined into `video.mp4` through the sequencer (tainted: the segments are workspace files) |
@@ -161,7 +161,11 @@ process started in one call is still there for the next (`sys._cycls_blender`). 
 stdin as job directories; answers come back on a dedicated fd, as JSON and raw files — never a
 pickle built from Blender's output, because the agent server unpickles the reply while holding
 secrets. Boot ~1 s; a warm `evaluate` is ~7 ms in Blender and ~0.5 s end to end. The worker is
-replaced after 100 jobs, when its code changes, and after every `script`/`import`.
+replaced after 100 jobs, when its code changes, and after every `script`/`import`. One that dies
+mid-job is reported as a crash with its exit code (139 is a segfault, through bwrap), not as the
+op's timeout, and the next call starts another. Blender's own output goes to one log under `/tmp`,
+which is memory: each worker starts it over and it is emptied past 4 MB — so a `script` worker,
+which can read its own stdout back, never finds another job's output there.
 
 **The sandbox.** The runtime is gVisor, where bwrap can't make a network namespace, so Blender
 runs under `unshare --net` wrapped around bwrap: its own pid/ipc/uts namespaces, uid 65534, a
@@ -169,6 +173,18 @@ read-only root, `/app` masked, `--new-session`, and `-Y` so a `.blend` can't aut
 scripts. A `script` or `import` gets a fresh
 worker that can see only its own job directory and is killed after. With no sandbox available the
 engine refuses those two ops rather than run them bare.
+
+**How heavy a scene may get.** Modifiers multiply faces — a subdivision level is 4×, an array its
+count, a mirror 2× an axis, a voxel remesh the object's surface in voxels — so the engine weighs a
+scene from the document before Blender runs any of it (`scene.py heft`, which errs low: bevels and
+solidify add faces it leaves out). Past 4,000,000 faces it refuses, naming the heaviest object: at a
+render's levels for snapshot, render and video, at the viewport's for everything else, and an
+evaluate that would pass the viewport's 1.5M triangles is refused before the work, not after it.
+Measured on the 8 GiB engine: 2M faces of subdivision is 1.7 GB of Blender, 4M of array 2.0 GB, 8M
+more than it has. Behind the estimate the parent watches Blender's memory four times a second and
+stops a job past 5 GiB (`… ran out of memory`): a job that takes the whole instance's memory takes
+its reply and its timeout with it — six stacked Subsurfs once held a snapshot for over 400 s.
+Every answer carries `mem_mb`, the most Blender was seen to hold.
 
 **Limits.** 100 MB of meshes and images per scene (the engine takes 110 MB in, 160 MB out — an
 import's meshes come back base64), 100 MB per imported file, per-op timeouts, `max_instances=4` (a cost ceiling, shared by
@@ -239,7 +255,8 @@ one (3.5–4.3 s).
 is `studio` **and** `app.json` carries the installer's stamp — a hand-written app at that path gets
 nothing. It allows the app ops only (never `script` or `import`), normalizes the scene it's sent,
 and resolves mesh files only from the app's own `data/meshes/`. Budgets per subject: 60 calls a
-minute, 30 renders an hour, one render at a time. It saves what the engine made — `renders/*.png`
+minute, 30 renders an hour, one render at a time. A snapshot's `samples` aren't the app's to raise
+(the route drops them): more samples is a render, and budgeted as one. It saves what the engine made — `renders/*.png`
 plus the log, mesh files, `exports/*` — before answering, so a tab closed mid-render loses nothing.
 One op never reaches the engine: `open {path}` answers `{open: path}` for a render the log lists or
 a file under `exports/`, and the host bridge opens it on the canvas (the Renders list, the preview's
@@ -299,7 +316,8 @@ size on the canvas.
 **Object mode.** Click, Shift-click, A; the gizmo and G/R/S; Shift+A add, Shift+D duplicate, X
 delete, H hide; numpad views, frame, camera to view; Solid or Material shading; F12 render and a
 Snapshot button. Outliner (tree, visibility, rename) and properties: object, the data of each type,
-material (Principled plus presets), modifiers (engine-evaluated, debounced, cached; Apply), world
+material (Principled plus presets), modifiers (added from a menu — a `<select>` there added one for every key typed at it —
+engine-evaluated, debounced, cached; Apply), world
 and render. The Object menu runs Blender's convert, join (Ctrl+J), triangulate, merge, normals,
 remesh and decimate.
 
@@ -460,4 +478,5 @@ carried. The tool counts material notes for the model rather than listing dozens
 - The engine's own: `studio_try.py dev|remote selftest evaluate …` round-trips every object type
   and modifier through Blender and back; `anim` round-trips keys and regenerates
   `anim_golden.json`, `anim-io` round-trips motion through blend/glb/fbx, `video` renders and joins
-  two segments (with a decode check).
+  two segments (with a decode check). `engine/test_render_fn.py` runs the worker's parent side over
+  a stand-in `blender` (POSIX only): a job, a crash, a hang, a job that eats memory, the log.

@@ -457,10 +457,20 @@ def _world(w):
     bg.inputs["Color"].default_value = (*S.hex_to_linear(w["color"]), 1.0)
 
 
+def _fits(doc, cap, what, render=False, ids=None):
+    """Refuse a scene whose modifiers would grow it past `cap` faces before Blender runs them:
+    such a stack takes the instance's memory, and the job's answer with it."""
+    total, oid, n = S.heft(doc, render, ids)
+    if total > cap:
+        raise ValueError(f"{oid} is about {n:,} faces once its modifiers run, the scene {total:,} — {what}. "
+                         "Lower the subdivision levels or remove a modifier")
+
+
 def build(doc, jobdir):
     """Scene document → bpy. Returns {id: object}."""
     reset()
     doc = S.normalize(doc)
+    _fits(doc, S.MAX_FACES, f"the engine holds {S.MAX_FACES:,}")      # the update below runs every stack
     scene = bpy.context.scene
     mats = {}
     images = _texture_images(doc, jobdir)
@@ -1145,8 +1155,11 @@ def _save(jobdir, name, data):
 def op_evaluate(job, jobdir):
     """Display meshes for the viewport: each object after its modifiers, as
     per-corner (loop) positions + normals and a triangle index — raw buffers."""
-    objs = build(job["scene"], jobdir)
-    ids = (job.get("params") or {}).get("ids") or [k for k, o in objs.items() if o.type in ("MESH", "FONT")]
+    doc = S.normalize(job["scene"])
+    ids = (job.get("params") or {}).get("ids")
+    _fits(doc, S.MAX_TRIS, f"the viewport draws {S.MAX_TRIS:,} triangles", ids=ids or None)
+    objs = build(doc, jobdir)
+    ids = ids or [k for k, o in objs.items() if o.type in ("MESH", "FONT")]
     dg = bpy.context.evaluated_depsgraph_get()
     out, total = {}, 0
     for oid in ids:
@@ -1158,7 +1171,7 @@ def op_evaluate(job, jobdir):
         me.calc_loop_triangles()
         nl, nt = len(me.loops), len(me.loop_triangles)
         total += nt
-        if total > 1_500_000:
+        if total > S.MAX_TRIS:
             ev.to_mesh_clear()
             raise ValueError("evaluated scene is over 1.5M triangles — lower subdivision levels")
         vi = np.empty(nl, np.int32)
@@ -1189,8 +1202,12 @@ def op_evaluate(job, jobdir):
     return {"meshes": out, "tris": total}
 
 
+_RENDER_HOLDS = f"a render holds {S.MAX_FACES:,}, and Subsurf's render levels count in one"
+
+
 def _render_to(job, jobdir, resolution, samples):
     doc = S.normalize(job["scene"])
+    _fits(doc, S.MAX_FACES, _RENDER_HOLDS, render=True)
     objs = build(doc, jobdir)
     cam = doc["render"]["camera"]
     if not cam:
@@ -1210,10 +1227,13 @@ def _render_to(job, jobdir, resolution, samples):
 
 def op_snapshot(job, jobdir):
     p = job.get("params") or {}
+    samples = int(p.get("samples") or 12)
+    if not 1 <= samples <= S.MAX_SAMPLES:
+        raise ValueError(f"snapshot: 1–{S.MAX_SAMPLES} samples")
     w, h = S.normalize(job["scene"])["render"]["resolution"]
     k = 640 / max(w, h)
     res = [max(16, int(w * k)), max(16, int(h * k))] if k < 1 else [w, h]
-    secs = _render_to(job, jobdir, res, int(p.get("samples", 12)))
+    secs = _render_to(job, jobdir, res, samples)
     return {"preview": "preview.jpg", "render_seconds": secs, "resolution": res}
 
 
@@ -1312,6 +1332,7 @@ def op_video(job, jobdir):
     samples = int(p.get("samples") or doc["render"]["samples"])
     if w < 16 or h < 16 or w * h > VIDEO_MAX_PIXELS or not 1 <= samples <= VIDEO_MAX_SAMPLES:
         raise ValueError(f"video: at most 1280x720 pixels and {VIDEO_MAX_SAMPLES} samples")
+    _fits(doc, S.MAX_FACES, _RENDER_HOLDS, render=True)
     objs = build(doc, jobdir)
     cam = doc["render"]["camera"]
     if not cam:
@@ -1498,9 +1519,15 @@ def op_apply(job, jobdir):
         mods_left = doc_mods[:idx] + doc_mods[idx + 1:]
     elif name in ("remesh", "decimate", "boolean"):
         spec = {"type": name, **{k: v for k, v in p.items() if k not in ("id", "op", "selection")}}
-        md = _modifier(ob, S.normalize({"objects": {"x": {"type": "mesh", "mesh": "m", "modifiers": [spec]},
-                                                    **({spec["object"]: {"type": "empty"}} if name == "boolean" and spec.get("object") else {})},
-                                        "meshes": {"m": {"primitive": "cube"}}})["objects"]["x"]["modifiers"][0], objs)
+        spec = S.normalize({"objects": {"x": {"type": "mesh", "mesh": "m", "modifiers": [spec]},
+                                        **({spec["object"]: {"type": "empty"}} if name == "boolean" and spec.get("object") else {})},
+                            "meshes": {"m": {"primitive": "cube"}}})["objects"]["x"]["modifiers"][0]
+        box = [[c[i] for c in ob.bound_box] for i in range(3)]
+        n = S.grown(len(ob.data.polygons), [spec], size=[max(a) - min(a) for a in box])
+        if n > S.MAX_TRIS:                       # a fine voxel over a big object: millions of faces to hand back
+            raise ValueError(f"{oid!r} would be about {n:,} faces — the Studio draws {S.MAX_TRIS:,} triangles. "
+                             "Use a larger voxel size")
+        md = _modifier(ob, spec, objs)
         bpy.ops.object.modifier_move_to_index(modifier=md.name, index=0)
         bpy.ops.object.modifier_apply(modifier=md.name)
     elif name == "convert":

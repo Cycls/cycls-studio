@@ -156,6 +156,8 @@ def studio_router(ws_dep, user_dep):
         params = body.get("params") or {}
         if not isinstance(params, dict):
             raise HTTPException(400, "params must be an object")
+        if op == "snapshot":               # the quick look, at the engine's few samples: more is a render, budgeted as one
+            params = {k: v for k, v in params.items() if k != "samples"}
         try:
             doc = S.normalize(body["scene"]) if body.get("scene") is not None else await store.load(ws)
             if op == "evaluate" and isinstance(params.get("ids"), list):

@@ -141,7 +141,7 @@ def main(where, steps):
         t = time.monotonic()
         r = call(**kw)
         wall = time.monotonic() - t
-        meta = {k: r.get(k) for k in ("ok", "seconds", "spawned", "boot_s", "sandbox", "jobs", "error") if k in r}
+        meta = {k: r.get(k) for k in ("ok", "seconds", "spawned", "boot_s", "sandbox", "jobs", "mem_mb", "error") if k in r}
         print(f"{tag:22} wall {wall:5.1f}s {json.dumps(meta)}")
         if not r.get("ok") and r.get("trace"):
             print(r["trace"][-1200:])

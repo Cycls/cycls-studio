@@ -22,6 +22,9 @@ MAX_SLOTS = 32
 
 MAX_PIXELS = 1920 * 1080
 MAX_SAMPLES = 256
+MAX_TRIS = 1_500_000        # what the viewport is sent: an evaluate past it is refused
+MAX_FACES = 4_000_000       # what the engine builds once modifiers have run. Measured on its 8 GiB: 2M faces of
+                            # subdivision is 1.7 GB of Blender, 4M of array 2.0 GB, 8M more than there is
 MAX_OBJECTS = 10_000        # a kitbashed city block is thousands of objects sharing a few hundred meshes
 SUMMARY_OBJECTS = 80        # the model's table lists this many; the rest by count
 LAYOUT_SUBJECTS = 300       # the floating check compares every pair; past this it's skipped
@@ -845,6 +848,79 @@ def local_bounds(doc, oid):
     if p == "cyclorama":
         return [[-m["width"] / 2, -m["depth"], 0], [m["width"] / 2, m["radius"], m["height"]]]
     raise AssertionError(p)
+
+
+def mesh_faces(m):
+    """A mesh entry's faces: an explicit mesh says, a primitive's follow from its parameters."""
+    if "primitive" not in m:
+        return m.get("faces", 0)
+    p = m["primitive"]
+    if p == "grid":
+        return m["x_segments"] * m["y_segments"]
+    if p == "circle":
+        return {"none": 0, "ngon": 1, "trifan": m["vertices"]}[m["fill"]]
+    if p == "uv_sphere":
+        return m["segments"] * m["ring_count"]
+    if p == "ico_sphere":
+        return 20 * 4 ** (m["subdivisions"] - 1)
+    if p in ("cylinder", "cone"):
+        return m["vertices"] + 2
+    if p == "torus":
+        return m["major_segments"] * m["minor_segments"]
+    if p == "cyclorama":
+        return m["segments"] + 2
+    return {"plane": 1, "cube": 6, "monkey": 500}[p]
+
+
+def grown(faces, modifiers, render=False, size=(0.0, 0.0, 0.0)):
+    """About how many faces a mesh of `faces` is at the fattest point of its modifier stack,
+    counting what multiplies: a subdivision level is 4x, an array its count, a mirror 2x an
+    axis, a voxel remesh the surface of its `size` (the object's own extent) in voxels. Bevels,
+    solidify and wireframes add faces it leaves out, so it errs low — what it calls too many is."""
+    n = peak = max(1, faces)
+    for m in modifiers:
+        if not m.get("show", True):
+            continue
+        t = m["type"]
+        if t == "subsurf":
+            n *= 4 ** m["render_levels" if render else "levels"]
+        elif t == "array":
+            n *= m["count"]
+        elif t == "mirror":
+            n *= 2 ** sum(map(bool, m["axis"]))
+        elif t == "remesh" and any(size):
+            a, b, c = size
+            n = max(1, round(2 * (a * b + b * c + c * a) / m["voxel_size"] ** 2))
+        elif t == "decimate":
+            n = max(1, round(n * m["ratio"]))
+        peak = max(peak, n)
+    return peak
+
+
+def heft(doc, render=False, ids=None):
+    """(faces in all, the heaviest object's id, its faces) once the modifiers have run, by `grown`:
+    at a render's levels and only what renders with `render`, else the viewport's, of `ids` or
+    everything. Objects sharing a mesh with no modifiers on it count once. The engine asks before
+    Blender runs a stack — six subdivisions are billions of faces, and the instance's memory."""
+    total, worst, shared = 0, (0, None), set()
+    for oid in doc["objects"] if ids is None else ids:
+        o = doc["objects"].get(oid)
+        if o is None or o["type"] not in ("mesh", "text") or (render and not (o["visible"] and o["renderable"])):
+            continue
+        mods = [m for m in o["modifiers"] if m["show"]]
+        if o["type"] == "text":
+            base = 150 * len(o["text"]["body"])               # a glyph, extruded and capped: about that
+        else:
+            if not mods:
+                if o["mesh"] in shared:
+                    continue
+                shared.add(o["mesh"])
+            base = mesh_faces(doc["meshes"][o["mesh"]])
+        lo, hi = local_bounds(doc, oid)
+        n = grown(base, mods, render, [b - a for a, b in zip(lo, hi)])
+        total += n
+        worst = max(worst, (n, oid))
+    return total, worst[1], worst[0]
 
 
 def world_matrix(doc, oid):
