@@ -23,13 +23,24 @@ async def my_agent(context):
 
 ```
 CYCLS_STUDIO_ENGINE=cycls-render      # the deployed Blender engine (engine/)
-CYCLS_API_KEY=...                     # cycls.remote calls the engine with it
+CYCLS_API_KEY=...                     # cycls.remote calls the engine with it: a key of the account that owns it
+CYCLS_STUDIO_RENDERER=https://…       # optional: the GPU renderer (engine/modal_fn.py) for render and video
+CYCLS_STUDIO_RENDERER_KEY=...         # its key
 ```
 
 `.use(Studio())` adds the `studio` tool to every `llm.run()` of the agent and mounts the route the
-app calls Blender through. Without the env vars, the tool isn't offered. A person can switch it off
-in Settings like a builtin. It needs a `cycls` with the extension hook (`cycls.Extension`):
-the SDK's `feat/extensions` branch until it reaches main.
+app calls Blender through. Without the first two env vars, the tool isn't offered. A person can
+switch it off in Settings like a builtin.
+
+What the agent needs besides:
+
+- A `cycls` with the extension hook (`cycls.Extension`, `Web().use`): the SDK's `feat/extensions`
+  branch until it reaches main. An agent built on another SDK branch can't `.use()` anything.
+- Python 3.12, as the engine runs: a call to it needs the same Python on both sides.
+- `.auth(...)` on its `Web`, and a workspace volume: the Studio installs its app into each workspace.
+- To pick up a change here, a new image: pin the package by commit
+  (`…/cycls-studio/archive/<sha>.zip`) and bump the pin, since a `main.zip` line that hasn't
+  changed leaves the old package in a cached layer.
 
 ## What's here
 
