@@ -1279,6 +1279,8 @@ def _op_frame(doc, op, where, selection):
     o["parent"] = None
     o["location"] = eye
     o["rotation"] = look_rotation(eye, center)
+    # A site hundreds of metres across puts the camera past its own 1 km far clip: reach the far side.
+    o["camera"]["clip_end"] = min(1e6, max(o["camera"]["clip_end"], round((dist + radius) * 1.2, 3)))
     doc.update(normalize(doc))
     return [f"objects.{cam}"]
 

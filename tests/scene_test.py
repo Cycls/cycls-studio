@@ -141,6 +141,19 @@ class TestTransforms:
                         d = S._norm(S._sub([x, y, z], cam["location"]))
                         assert math.degrees(math.acos(max(-1, min(1, S._dot(d, view))))) <= math.degrees(half) + 1e-6
 
+    def test_frame_reaches_the_far_side_of_a_site(self):
+        # a venue 400 m across puts the camera over a kilometre back: past its default far clip, which cut the venue out
+        doc, _ = S.apply_ops(S.new_scene(), [
+            {"op": "delete", "id": "cube"},
+            {"op": "add", "id": "hall", "primitive": "cube", "scale": [200, 120, 8], "on_floor": True},
+            {"op": "frame", "angle": "front-3/4"}])
+        cam = doc["objects"]["camera"]
+        b = S.world_bounds(doc, "hall")
+        far = max(math.dist(cam["location"], [x, y, z]) for x in (b[0][0], b[1][0]) for y in (b[0][1], b[1][1]) for z in (b[0][2], b[1][2]))
+        assert math.dist(cam["location"], [0, 0, 8]) > 1000 and cam["camera"]["clip_end"] > far
+        small, _ = S.apply_ops(S.new_scene(), [{"op": "frame", "angle": "front"}])
+        assert small["objects"]["camera"]["camera"]["clip_end"] == 1000.0           # a tabletop scene keeps its own
+
 
 # ─── ops ────────────────────────────────────────────────────────────────────
 
