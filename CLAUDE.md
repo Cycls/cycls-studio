@@ -36,7 +36,7 @@ cd engine && PYTHONPATH=.. python studio_try.py dev selftest evaluate snapshot  
 ```
 
 The package needs a `cycls` with the extension hook. Until that reaches the SDK's main,
-`pyproject.toml` points at its `feat/extensions` branch (`[tool.uv.sources]`). This repo is not
+`pyproject.toml` points at its `feat/agent-design-extensions` branch (`[tool.uv.sources]`). This repo is not
 published to PyPI.
 
 ## Gotchas

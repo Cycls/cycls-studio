@@ -34,8 +34,9 @@ switch it off in Settings like a builtin.
 
 What the agent needs besides:
 
-- A `cycls` with the extension hook (`cycls.Extension`, `Web().use`): the SDK's `feat/extensions`
-  branch until it reaches main. An agent built on another SDK branch can't `.use()` anything.
+- A `cycls` with the extension hook (`cycls.Extension`, `Web().use`): the SDK's
+  `feat/agent-design-extensions` branch until it reaches main (it carries the Design tool as
+  well). An agent built on another SDK branch can't `.use()` anything.
 - Python 3.12, as the engine runs: a call to it needs the same Python on both sides.
 - `.auth(...)` on its `Web`, and a workspace volume: the Studio installs its app into each workspace.
 - To pick up a change here, a new image: pin the package by commit
