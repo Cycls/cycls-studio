@@ -14,6 +14,56 @@ from cycls.extension import api_key
 
 from . import engine_name, renderer_name, wire
 
+
+def _consume_linear(name, r):
+    """cycls.remote's reply reader, linear in the reply's size. The SDK's own (cycls/_function/
+    remote.py `_consume`) grows a bytes object 8 KB at a time — `buf += chunk` copies everything
+    received so far, every chunk — so a reply's time grows with its size squared: 100 MB took
+    9 minutes, the ~200 MB an imported venue scene brings back over 30 (the engine's limit). Same
+    framing (`o` stdout, `r` pickled result, `e` traceback), read into one bytearray."""
+    import sys
+    import cloudpickle
+    from cycls._function import remote as R
+    result, buf, pos, need, kind = R._MISSING, bytearray(), 0, None, None
+    for chunk in r.iter_bytes(1 << 20):
+        buf += chunk
+        while True:
+            if need is None:
+                if len(buf) - pos < 5:
+                    break
+                kind, need = bytes(buf[pos:pos + 1]), int.from_bytes(buf[pos + 1:pos + 5], "big")
+                pos += 5
+            if len(buf) - pos < need:
+                break
+            data, pos, need = bytes(buf[pos:pos + need]), pos + need, None
+            if kind == b"o":
+                sys.stdout.write(data.decode(errors="replace"))
+                sys.stdout.flush()
+            elif kind == b"e":
+                raise R.RemoteError(f"{name}: {data.decode(errors='replace')[:2000]}", status=500)
+            else:
+                result = cloudpickle.loads(data)
+        if pos and pos >= len(buf) // 2:              # drop what has been read, now and then
+            del buf[:pos]
+            pos = 0
+    if result is R._MISSING:
+        raise R.RemoteError(f"{name}: stream ended without a result", status=502)
+    return result
+
+
+def _patch_remote():
+    """Bonafide: cycls.remote reads replies with _consume_linear, while the SDK carries the
+    quadratic reader (every cycls.remote call in this process benefits)."""
+    try:
+        from cycls._function import remote as R
+    except ImportError:
+        return
+    if getattr(getattr(R, "_consume", None), "__name__", "") == "_consume" and hasattr(R, "_MISSING"):
+        R._consume = _consume_linear
+
+
+_patch_remote()
+
 TIMEOUTS = {"evaluate": 90, "apply": 150, "snapshot": 150, "render": 660, "export": 210,
             "script": 150, "import": 1530, "selftest": 150, "ping": 60, "texture": 90,
             "video": 660, "encode": 210}

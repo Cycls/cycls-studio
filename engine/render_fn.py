@@ -534,6 +534,22 @@ def render(config: dict = None, *, op: str = None, scene: dict = None, blobs: di
 
 
 if cycls:
+    # Bonafide: the SDK's remote shim reads a request by growing bytes per ASGI message, which
+    # copies everything received so far each time — minutes for a 150 MB scene going up. Read
+    # in one join instead, in the shim this deploy writes (cycls/_function/remote.py SHIM_PRELUDE).
+    try:
+        from cycls._function import remote as _R
+        _SLOW = ('async def read(receive):\n    body, more = b"", True\n    while more:\n'
+                 '        msg = await receive()\n        body += msg.get("body", b"")\n'
+                 '        more = msg.get("more_body", False)\n    return body')
+        _FAST = ('async def read(receive):\n    parts, more = [], True\n    while more:\n'
+                 '        msg = await receive()\n        parts.append(msg.get("body", b""))\n'
+                 '        more = msg.get("more_body", False)\n    return b"".join(parts)')
+        if _SLOW in getattr(_R, "REMOTE_PY", ""):
+            _R.REMOTE_PY = _R.REMOTE_PY.replace(_SLOW, _FAST)
+    except ImportError:
+        pass
+    # An hour, Cloud Run's most: a big import never meets the limit halfway through its reply.
     render = cycls.function(name="bonafide-studio", image=image, cpu=8, memory="32Gi",
-                            timeout=1800, concurrency=1)(render)
+                            timeout=3600, concurrency=1)(render)
     render.spec["max_instances"] = 4     # cost ceiling; the decorator doesn't expose it
