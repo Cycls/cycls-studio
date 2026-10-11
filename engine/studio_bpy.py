@@ -747,7 +747,7 @@ def _mapping_back(tex, out, notes, mat):
 
 
 INSTANCE_SET_MAX = 2000        # one instancer's repeats that come in as objects
-BAKE_MAX = 80                  # node-driven inputs averaged per job (a few tenths of a second each)
+BAKE_MAX = 1500                # node-driven inputs averaged per job (a few tenths of a second each; Bonafide: was 80)
 _bakes = {"n": 0}
 
 
@@ -807,6 +807,397 @@ def _mean_of(mat, sock):
         bpy.data.meshes.remove(me)
         bpy.data.images.remove(img)
         bpy.data.scenes.remove(sc)
+
+
+# ── Bonafide: venue scenes as the Studio can carry them ────────────────────────────────────────
+# The document carries a Principled material's plain values and the images wired straight into
+# it, on the mesh's UVs. Bonafide's scenes are procedural materials (noise, bricks, ramps, mixes)
+# and box-mapped scans, on meshes built without UVs: on import they came in as flat averages, and
+# past BAKE_MAX as white. Before to_doc reads them, studio_ready() bakes each node-driven base
+# colour into a tileable image, moves box-mapped images onto UVs and gives the meshes that need
+# them box-projected UVs in metres, so to_doc finds plain image materials and carries them.
+TILE_M = 4.0                   # metres a baked tile spans (it repeats)
+TILE_PX = 512                  # its pixels a side
+BAKED_MAX = 128                # tiles per import; past it (or the document's image cap), averages
+BOX_UV = "StudioBox"
+
+
+def _coords_of(tex):
+    """Where a texture node reads its coordinates — 'uv', 'object' (Object or Generated, a
+    procedural texture's default) or 'other' — and the TEX_COORD link it reads them through."""
+    v = tex.inputs.get("Vector")
+    for _ in range(6):
+        if v is None or not v.is_linked:
+            return ("uv" if tex.type == "TEX_IMAGE" else "object"), None
+        link = v.links[0]
+        n = link.from_node
+        if n.type == "MAPPING":
+            v = n.inputs["Vector"]
+            continue
+        if n.type == "UVMAP":
+            return "uv", None
+        if n.type == "TEX_COORD":
+            return {"UV": "uv", "Object": "object", "Generated": "object"}.get(link.from_socket.name, "other"), link
+        return "other", None
+    return "other", None
+
+
+def _upstream(sock, limit=300):
+    """The nodes a socket's value is made from."""
+    seen, out, todo = set(), [], [l.from_node for l in sock.links]
+    while todo and len(out) < limit:
+        n = todo.pop()
+        if n.as_pointer() in seen:
+            continue
+        seen.add(n.as_pointer())
+        out.append(n)
+        for i in n.inputs:
+            todo += [l.from_node for l in i.links]
+    return out
+
+
+_GROUP_INPUTS = (("Base Color", ("base", "diffuse", "albedo", "colour", "color")), ("Roughness", ("rough",)),
+                 ("Metallic", ("metal",)), ("Alpha", ("alpha", "opacity")))
+
+
+def _as_principled(mat):
+    """A material with no Principled BSDF — an Emission, Glossy, Glass, Diffuse shader, or a
+    custom group (a library model's leaves and bark) — given one, wired from the same sources and
+    plugged into its output, so the rest reads it like any other. Returns True if it changed."""
+    tree = mat.node_tree if mat is not None and mat.use_nodes else None
+    if tree is None or any(n.type == "BSDF_PRINCIPLED" for n in tree.nodes):
+        return False
+    out = next((n for n in tree.nodes if n.type == "OUTPUT_MATERIAL" and n.is_active_output),
+               next((n for n in tree.nodes if n.type == "OUTPUT_MATERIAL"), None))
+    if out is None or not out.inputs["Surface"].is_linked:
+        return False
+    sh = out.inputs["Surface"].links[0].from_node
+    for _ in range(4):                                    # through mixes: the first non-transparent shader
+        if sh.type not in ("MIX_SHADER", "ADD_SHADER"):
+            break
+        socks = [i for i in sh.inputs if i.type == "SHADER" and i.is_linked]
+        pick = [i for i in socks if i.links[0].from_node.type != "BSDF_TRANSPARENT"] or socks
+        if not pick:
+            return False
+        sh = pick[0].links[0].from_node
+    p = tree.nodes.new("ShaderNodeBsdfPrincipled")
+
+    def take(src_name, dst_name, node=sh):
+        """The source of one input — its link, or its value — onto the Principled's."""
+        src, dst = node.inputs.get(src_name), p.inputs.get(dst_name)
+        if src is None or dst is None:
+            return
+        if src.is_linked:
+            tree.links.new(src.links[0].from_socket, dst)
+            return
+        v, dv = getattr(src, "default_value", None), dst.default_value
+        if v is None:
+            return
+        try:
+            if hasattr(v, "__len__") and hasattr(dv, "__len__"):
+                dst.default_value = (list(v) + [1.0] * len(dv))[:len(dv)]
+            elif hasattr(v, "__len__"):
+                dst.default_value = float(sum(v[:3]) / 3)
+            elif hasattr(dv, "__len__"):
+                dst.default_value = ([float(v)] * 3 + [1.0])[:len(dv)]
+            else:
+                dst.default_value = float(v)
+        except (TypeError, ValueError):
+            pass
+    t = sh.type
+    if t == "EMISSION":
+        take("Color", "Base Color"); take("Color", "Emission Color"); take("Strength", "Emission Strength")
+    elif t in ("BSDF_DIFFUSE", "BSDF_TRANSLUCENT", "SUBSURFACE_SCATTERING", "BSDF_SHEEN"):
+        take("Color", "Base Color")
+        p.inputs["Roughness"].default_value = 1.0
+    elif t in ("BSDF_GLOSSY", "BSDF_ANISOTROPIC"):
+        take("Color", "Base Color"); take("Roughness", "Roughness")
+        p.inputs["Metallic"].default_value = 1.0
+    elif t in ("BSDF_GLASS", "BSDF_REFRACTION"):
+        take("Color", "Base Color"); take("Roughness", "Roughness"); take("IOR", "IOR")
+        p.inputs["Transmission Weight"].default_value = 1.0
+    elif t == "GROUP":
+        for dst, words in _GROUP_INPUTS:
+            src = next((i for i in sh.inputs if any(w in i.name.lower() for w in words)
+                        and (i.is_linked or hasattr(i, "default_value"))), None)
+            if src is not None:
+                take(src.name, dst)
+        nrm = next((i for i in sh.inputs if "normal" in i.name.lower() and i.is_linked), None)
+        if nrm is not None and nrm.links[0].from_node.type == "TEX_IMAGE":
+            nm = tree.nodes.new("ShaderNodeNormalMap")
+            tree.links.new(nrm.links[0].from_socket, nm.inputs["Color"])
+            tree.links.new(nm.outputs["Normal"], p.inputs["Normal"])
+    else:
+        tree.nodes.remove(p)
+        return False
+    tree.links.new(p.outputs["BSDF"], out.inputs["Surface"])
+    return True
+
+
+def _kind(mat):
+    """(principled, kind, space): kind 'plain' (nothing to do), 'image' (an image straight in) or
+    'nodes' (a network to bake); space the coordinates it reads, 'uv' or 'object'."""
+    tree = mat.node_tree if mat is not None and mat.use_nodes else None
+    bsdf = next((n for n in tree.nodes if n.type == "BSDF_PRINCIPLED"), None) if tree else None
+    if bsdf is None or not bsdf.inputs["Base Color"].is_linked:
+        return bsdf, "plain", None
+    src = bsdf.inputs["Base Color"].links[0].from_node
+    if src.type == "TEX_IMAGE" and src.image is not None:
+        return bsdf, "image", "object" if (_coords_of(src)[0] == "object" or src.projection == "BOX") else "uv"
+    spaces = {("object" if n.type == "TEX_IMAGE" and n.projection == "BOX" else _coords_of(n)[0])
+              for n in _upstream(bsdf.inputs["Base Color"]) if n.type.startswith("TEX_") and n.type != "TEX_COORD"}
+    return bsdf, "nodes", ("uv" if "uv" in spaces else "object")
+
+
+def _images_onto_uvs(mat):
+    """A box-mapped or object-space image reads the mesh's (box-projected) UVs instead, through
+    the same Mapping node, so its tile size carries over as the texture's scale."""
+    tree = mat.node_tree
+    for n in [n for n in tree.nodes if n.type == "TEX_IMAGE"]:
+        space, link = _coords_of(n)
+        if space != "object" and n.projection != "BOX":
+            continue
+        n.projection = "FLAT"
+        if link is not None:
+            tree.links.new(link.from_node.outputs["UV"], link.to_socket)
+
+
+def _seamless(a):
+    """A tile that repeats without a seam: blended, towards its edges, with itself shifted half
+    a tile (whose edges are the tile's own middle, continuous across the wrap)."""
+    h, w = a.shape[:2]
+    b = np.roll(a, (h // 2, w // 2), axis=(0, 1))
+    ry, rx = 1.0 - np.abs(np.linspace(-1.0, 1.0, h)), 1.0 - np.abs(np.linspace(-1.0, 1.0, w))
+    m = np.clip(np.minimum.outer(ry, rx) * 3.0, 0.0, 1.0)[..., None]
+    return a * m + b * (1.0 - m)
+
+
+def _tile_image(name, px, space, alpha=None):
+    """Baked linear pixels → an sRGB image, packed (to_doc passes its bytes through): a JPEG, or
+    a PNG when it carries an alpha (cut-out leaves)."""
+    a = px.reshape(TILE_PX, TILE_PX, 4)[:, :, :3]
+    al = np.ones((TILE_PX, TILE_PX, 1), np.float32) if alpha is None else np.clip(alpha, 0.0, 1.0)[..., None]
+    if space == "object":
+        a = _seamless(a)
+        al = _seamless(al)
+    a = np.clip(a, 0.0, 1.0)
+    srgb = np.where(a <= 0.0031308, a * 12.92, 1.055 * np.power(a, 1 / 2.4) - 0.055).astype(np.float32)
+    img = bpy.data.images.new(("tile " + name)[:60], TILE_PX, TILE_PX, alpha=alpha is not None)
+    img.pixels.foreach_set(np.concatenate([srgb, al.astype(np.float32)], axis=2).ravel())
+    ext, fmt = ("png", "PNG") if alpha is not None else ("jpg", "JPEG")
+    path = os.path.join(ROOT_TMP, f"tile-{os.getpid()}-{len(bpy.data.images)}.{ext}")
+    img.filepath_raw = path
+    img.file_format = fmt
+    img.save(quality=88) if fmt == "JPEG" else img.save()
+    img.pack()
+    os.remove(path)
+    return img
+
+def _bake_tiles(todo, notes):
+    """Each material's node-driven base colour (and alpha, when nodes drive it: leaf cards),
+    baked by Cycles as emission onto a plane — a TILE_M square for an object-space network, the
+    0–1 UV square for a UV one — and wired back in as an image on the mesh's UVs. Returns how many."""
+    if not todo:
+        return 0
+    sc = bpy.data.scenes.new("_tiles")
+    sc.render.engine = "CYCLES"
+    sc.cycles.device, sc.cycles.samples = "CPU", 1
+    me = bpy.data.meshes.new("_tile")
+    bm = bmesh.new()
+    bm.loops.layers.uv.new("UVMap")
+    bmesh.ops.create_grid(bm, x_segments=1, y_segments=1, size=TILE_M / 2, calc_uvs=True)
+    bm.to_mesh(me)
+    bm.free()
+    ob = bpy.data.objects.new("_tile", me)
+    sc.collection.objects.link(ob)
+    vl = sc.view_layers[0]
+    buf = bpy.data.images.new("_tile_bake", TILE_PX, TILE_PX, float_buffer=True)
+
+    def bake(tree, out_node, src):
+        """One socket's value over the plane, as linear RGBA pixels."""
+        emit, holder = tree.nodes.new("ShaderNodeEmission"), tree.nodes.new("ShaderNodeTexImage")
+        holder.image = buf
+        try:
+            tree.links.new(src, emit.inputs["Color"])
+            tree.links.new(emit.outputs["Emission"], out_node.inputs["Surface"])
+            tree.nodes.active = holder
+            with bpy.context.temp_override(scene=sc, view_layer=vl, object=ob, active_object=ob,
+                                           selected_objects=[ob], selected_editable_objects=[ob]):
+                ob.select_set(True, view_layer=vl)
+                vl.objects.active = ob
+                bpy.ops.object.bake(type="EMIT", width=TILE_PX, height=TILE_PX, margin=0, use_clear=True)
+            px = np.empty(TILE_PX * TILE_PX * 4, np.float32)
+            buf.pixels.foreach_get(px)
+            return px
+        finally:
+            tree.nodes.remove(emit)
+            tree.nodes.remove(holder)
+
+    done = 0
+    try:
+        for mat, bsdf, space in todo:
+            tree = mat.node_tree
+            outs = [n for n in tree.nodes if n.type == "OUTPUT_MATERIAL"]
+            out_node = next((n for n in outs if n.is_active_output), outs[0] if outs else None)
+            if out_node is None:
+                continue
+            was = out_node.inputs["Surface"].links[0].from_socket if out_node.inputs["Surface"].is_linked else None
+            me.materials.clear()
+            me.materials.append(mat)
+            alpha_in = bsdf.inputs.get("Alpha")
+            tile = None
+            try:
+                px = bake(tree, out_node, bsdf.inputs["Base Color"].links[0].from_socket)
+                alpha = None
+                if alpha_in is not None and alpha_in.is_linked:
+                    alpha = bake(tree, out_node, alpha_in.links[0].from_socket).reshape(TILE_PX, TILE_PX, 4)[:, :, 0]
+                tile = _tile_image(mat.name, px, space, alpha)
+            except Exception as e:
+                notes.append(f"material {mat.name!r}: its base colour couldn't be baked "
+                             f"({type(e).__name__}: {str(e)[:120]}) — kept its average")
+            finally:
+                if was is not None:
+                    tree.links.new(was, out_node.inputs["Surface"])
+            if tile is None:
+                continue
+            tex, mp, tc = (tree.nodes.new("ShaderNodeTexImage"), tree.nodes.new("ShaderNodeMapping"),
+                           tree.nodes.new("ShaderNodeTexCoord"))
+            tex.image = tile
+            mp.vector_type = "POINT"
+            if space == "object":                   # the tile spans -TILE_M/2..TILE_M/2 of the object
+                mp.inputs["Scale"].default_value = (1 / TILE_M, 1 / TILE_M, 1.0)
+                mp.inputs["Location"].default_value = (0.5, 0.5, 0.0)
+            tree.links.new(tc.outputs["UV"], mp.inputs["Vector"])
+            tree.links.new(mp.outputs["Vector"], tex.inputs["Vector"])
+            tree.links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
+            if alpha_in is not None and alpha_in.is_linked:
+                tree.links.new(tex.outputs["Alpha"], alpha_in)
+            done += 1
+    finally:
+        bpy.data.objects.remove(ob)
+        bpy.data.meshes.remove(me)
+        bpy.data.images.remove(buf)
+        bpy.data.scenes.remove(sc)
+    return done
+
+def _box_uvs(me):
+    """UVs in metres, each face projected along its dominant axis (Blender's box mapping), as
+    the mesh's active layer."""
+    n, P = len(me.loops), len(me.polygons)
+    if not n or not P or len(me.uv_layers) >= 8:
+        return False
+    co = np.empty(len(me.vertices) * 3, np.float32)
+    me.vertices.foreach_get("co", co)
+    lv = np.empty(n, np.int32)
+    me.loops.foreach_get("vertex_index", lv)
+    nrm, start, tot = np.empty(P * 3, np.float32), np.empty(P, np.int64), np.empty(P, np.int64)
+    me.polygons.foreach_get("normal", nrm)
+    me.polygons.foreach_get("loop_start", start)
+    me.polygons.foreach_get("loop_total", tot)
+    order = np.argsort(start, kind="stable")
+    if start[order[0]] != 0 or tot.sum() != n or (np.cumsum(tot[order])[:-1] != start[order][1:]).any():
+        return False                                      # face loops aren't contiguous runs
+    poly = np.repeat(order, tot[order])
+    axis = np.abs(nrm.reshape(-1, 3)).argmax(axis=1)[poly]
+    q = co.reshape(-1, 3)[lv]
+    u = np.where(axis == 0, q[:, 1], q[:, 0])
+    v = np.where(axis == 2, q[:, 1], q[:, 2])
+    layer = me.uv_layers.new(name=BOX_UV)
+    if layer is None:
+        return False
+    layer.data.foreach_set("uv", np.column_stack([u, v]).astype(np.float32).ravel())
+    me.uv_layers.active = layer
+    layer.active_render = True
+    return True
+
+
+def _areas(objs):
+    """Each material's surface in the scene, square metres (roughly: the object's XY scale)."""
+    area = {}
+    for ob in objs:
+        me, P = ob.data, len(ob.data.polygons)
+        if not P or not ob.material_slots:
+            continue
+        a, mi = np.empty(P, np.float32), np.empty(P, np.int32)
+        me.polygons.foreach_get("area", a)
+        me.polygons.foreach_get("material_index", mi)
+        sx, sy, _ = ob.matrix_world.to_scale()
+        sums = np.bincount(np.clip(mi, 0, len(ob.material_slots) - 1), weights=a,
+                           minlength=len(ob.material_slots)) * abs(sx * sy)
+        for i, slot in enumerate(ob.material_slots):
+            if slot.material is not None:
+                area[slot.material.name] = area.get(slot.material.name, 0.0) + float(sums[i])
+    return area
+
+
+def studio_ready(notes):
+    """The scene's materials and meshes, made the kind the document carries (see above)."""
+    t0 = time.time()
+    objs = [ob for ob in bpy.context.scene.objects if ob.type == "MESH" and ob.data is not None]
+    mats = {}
+    for ob in objs:
+        for slot in ob.material_slots:
+            if slot.material is not None:
+                mats[slot.material.name] = slot.material
+    converted = sum(_as_principled(m) for m in mats.values())
+    kinds = {name: _kind(m) for name, m in mats.items()}
+    held = set()                       # images already wired straight in: they count against the cap
+    for bsdf, kind, space in kinds.values():
+        for sock in ("Base Color", "Roughness", "Normal"):
+            if bsdf is not None and sock in bsdf.inputs:
+                t, _ = _linked_image(bsdf.inputs[sock])
+                if t is not None and t.image is not None:
+                    held.add(t.image.name)
+    room = max(0, min(BAKED_MAX, S.MAX_TEXTURES - len(held) - 4))
+    area = _areas(objs)
+    nodes = sorted((n for n, k in kinds.items() if k[1] == "nodes"), key=lambda n: -area.get(n, 0.0))
+    for name, (bsdf, kind, space) in kinds.items():
+        if kind == "image" and space == "object":
+            _images_onto_uvs(mats[name])
+    baked = _bake_tiles([(mats[n], kinds[n][0], kinds[n][2]) for n in nodes[:room]], notes)
+    if len(nodes) > room:
+        notes.append(f"{len(nodes) - room} smaller node materials kept their average colour "
+                     f"(the document holds {S.MAX_TEXTURES} images)")
+    textured = {n for n, k in kinds.items() if k[1] == "image"} | set(nodes[:room])
+    on_uvs = {n for n, k in kinds.items() if k[1] == "image" and k[2] == "uv"} | \
+             {n for n in nodes[:room] if kinds[n][2] == "uv"}
+    boxed, seen = 0, set()
+    for ob in objs:
+        me = ob.data
+        if me.as_pointer() in seen:
+            continue
+        seen.add(me.as_pointer())
+        names = {sl.material.name for sl in ob.material_slots if sl.material is not None}
+        if len(me.uv_layers) and names & on_uvs:          # its own UVs, read by its own images
+            continue
+        if names & textured and _box_uvs(me):
+            boxed += 1
+    notes.append(f"Studio-ready in {time.time() - t0:.0f} s: {baked} node materials baked into "
+                 f"{TILE_M:g} m tiles, {boxed} meshes given box UVs, {converted} other shaders made Principled")
+
+
+def _fold_exposure(sc, notes):
+    """A file rendered at a negative exposure (Bonafide's: −2.8 EV under a strong sun) has its
+    exposure folded into its light — lamps, sun, glowing materials, and the caller scales the
+    world — since the Studio renders at 0 EV. Returns the factor."""
+    ev = float(getattr(sc.view_settings, "exposure", 0.0) or 0.0)
+    if ev > -0.25:
+        return 1.0
+    f = 2.0 ** ev
+    seen = set()
+    for ob in sc.objects:
+        if ob.type == "LIGHT" and ob.data is not None and ob.data.as_pointer() not in seen:
+            seen.add(ob.data.as_pointer())
+            ob.data.energy *= f
+    for mat in bpy.data.materials:
+        for n in (mat.node_tree.nodes if mat.node_tree else []):
+            sock = (n.inputs.get("Emission Strength") if n.type == "BSDF_PRINCIPLED"
+                    else n.inputs.get("Strength") if n.type == "EMISSION" else None)
+            if sock is not None and not sock.is_linked:
+                sock.default_value *= f
+    notes.append(f"the file's exposure ({ev:+.1f} EV) is folded into its light: lamps, sun, sky and "
+                 f"glowing materials x{f:.2f}")
+    return f
 
 
 def _material_back(mat, notes, doc=None, textures_out=None):
@@ -1724,6 +2115,8 @@ def op_import(job, jobdir):
     else:
         raise ValueError("ext: glb, gltf, obj, fbx, stl, ply or blend")
     _realize_instances(notes)
+    if ext == "blend":
+        studio_ready(notes)                    # Bonafide: textures the document can carry
     for ob in bpy.context.scene.objects:
         if "cycls_id" in ob:
             del ob["cycls_id"]
@@ -1844,10 +2237,11 @@ def _import_blend(path, notes):
             ob.hide_viewport = True
         if ob.name not in here.collection.objects:
             here.collection.objects.link(ob)
-    return {"world": _world_of(sc.world, notes), "camera": sc.camera.name if sc.camera else None}
+    f = _fold_exposure(sc, notes)
+    return {"world": _world_of(sc.world, notes, f), "camera": sc.camera.name if sc.camera else None}
 
 
-def _world_of(w, notes):
+def _world_of(w, notes, f=1.0):
     """A file's world as the document's: a plain colour carries over; a sky or an HDRI
     becomes the nearest Studio world (they're presets)."""
     tree = getattr(w, "node_tree", None) if w else None
@@ -1856,8 +2250,9 @@ def _world_of(w, notes):
         if n.type == "OUTPUT_WORLD" and n.is_active_output and n.inputs["Surface"].is_linked:
             bg = n.inputs["Surface"].links[0].from_node
     if bg is None or bg.type != "BACKGROUND":
-        return {"kind": "color", "color": _hex_of(w.color), "strength": 1.0} if w else None
-    strength = max(0.0, min(100.0, float(bg.inputs["Strength"].default_value)))
+        return {"kind": "color", "color": _hex_of(w.color), "strength": round(f, 4)} if w else None
+    # f: the file's exposure, folded in (a preset is the Studio's own, already at 0 EV)
+    strength = max(0.0, min(100.0, float(bg.inputs["Strength"].default_value) * f))
     col = bg.inputs["Color"]
     if not col.is_linked:
         return {"kind": "color", "color": _hex_of(col.default_value), "strength": round(strength, 4)}
