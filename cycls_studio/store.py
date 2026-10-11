@@ -19,7 +19,7 @@ from . import APP_DIR, SCENE
 from . import scene as S
 
 HISTORY_KEEP = 20
-MAX_BLOBS = 100_000_000           # a scene's meshes + images per engine call (the engine takes 110 MB)
+MAX_BLOBS = 500_000_000           # a scene's meshes + images per engine call (the engine takes 520 MB; Bonafide: was 100)
 MESH_TTL = 24 * 3600        # an unreferenced mesh/texture file younger than this may still be an open app's
 MAX_TEXTURE_BYTES = 8_000_000
 _MESH = re.compile(r"^meshes/m-[0-9a-f]{12}\.json$")

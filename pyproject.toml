@@ -24,3 +24,8 @@ packages = ["cycls_studio"]
 
 [tool.hatch.build.targets.sdist]
 include = ["cycls_studio/**/*", "README.md"]
+
+# Our deploy Mac is Intel: cryptography >= 46 ships no x86_64 macOS wheel and fails to
+# build from source here, so stay on the line that does.
+[tool.uv]
+constraint-dependencies = ["cryptography<46"]

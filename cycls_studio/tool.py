@@ -18,7 +18,7 @@ from . import APP_DIR, SLUG, engine, install, store, video
 from . import scene as S
 
 APP_ENTRY = f"{APP_DIR}/index.html"
-MAX_IMPORT = 100_000_000          # a model or image file from the workspace
+MAX_IMPORT = 500_000_000          # a model or image file from the workspace (Bonafide: 100 -> 500 MB, venue scenes)
 IMPORT_EXTS = ("glb", "gltf", "obj", "fbx", "stl", "ply", "blend")
 EXPORT_EXTS = {"glb": "glb", "blend": "blend", "fbx": "fbx", "obj": "obj", "stl": "stl"}
 

@@ -15,7 +15,7 @@ from cycls.extension import api_key
 from . import engine_name, renderer_name, wire
 
 TIMEOUTS = {"evaluate": 90, "apply": 150, "snapshot": 150, "render": 660, "export": 210,
-            "script": 150, "import": 330, "selftest": 150, "ping": 60, "texture": 90,
+            "script": 150, "import": 1530, "selftest": 150, "ping": 60, "texture": 90,
             "video": 660, "encode": 210}
 LONG_OPS = {"render", "video", "encode"}      # a separate renderer takes these, when there is one
 APP_OPS = {"evaluate", "apply", "snapshot", "render", "export"}      # what the Studio app may ask for

@@ -50,12 +50,12 @@ gpu_image = _with_engine(
     .env({"CYCLS_STUDIO_DEVICE": "gpu"}))
 web_image = _with_engine(_python.pip_install("fastapi[standard]==0.139.2"))
 
-app = modal.App("cycls-studio-renderer")
+app = modal.App("bonafide-studio-renderer")
 
 
 # One render a container, as the engine has one an instance; it idles five minutes before it goes
 # (a cold one boots Blender and loads the GPU kernels first). max_containers is the cost ceiling.
-@app.function(image=gpu_image, gpu=GPU, cpu=8, memory=16384, timeout=900, scaledown_window=300, max_containers=2)
+@app.function(image=gpu_image, gpu=GPU, cpu=8, memory=32768, timeout=900, scaledown_window=300, max_containers=2)
 def gpu(frame: bytes) -> bytes:
     import wire
 
@@ -72,7 +72,7 @@ def gpu(frame: bytes) -> bytes:
 
 
 @app.function(image=web_image, cpu=1, memory=2048, timeout=900, scaledown_window=120,
-              secrets=[modal.Secret.from_name("cycls-studio-renderer")])
+              secrets=[modal.Secret.from_name("bonafide-studio-renderer")])
 @modal.concurrent(max_inputs=16)
 @modal.asgi_app()
 def web():

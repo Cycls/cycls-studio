@@ -113,10 +113,10 @@ JOBS_ROOT = ROOT + "/jobs"
 # them again. Outside the jobs tree — a sandboxed worker never sees it — and bounded: /tmp is
 # memory here, so the least recently used go first past CACHE_MAX.
 CACHE_ROOT = ROOT + "/cache"
-CACHE_MAX = 1_200_000_000
+CACHE_MAX = 4_000_000_000             # Bonafide: was 1.2 GB, for 500 MB scenes (32 GiB box)
 _CACHEABLE = r"^(meshes/m-[0-9a-f]{12}\.json|textures/t-[0-9a-f]{12}\.(png|jpg))$"
 OP_TIMEOUT = {"ping": 30, "evaluate": 60, "apply": 120, "snapshot": 120, "render": RENDER_TIMEOUT,
-              "export": 180, "script": 120, "import": 300, "selftest": 120, "texture": 60,
+              "export": 180, "script": 120, "import": 1500, "selftest": 120, "texture": 60,
               "video": RENDER_TIMEOUT, "encode": 180}
 # Untrusted input — code, a model, an image, video segments from the workspace: a fresh worker each.
 TAINTED = {"script", "import", "texture", "encode"}
@@ -129,9 +129,9 @@ LOG_MAX = 4_000_000
 # Blender's share of the instance's 8 GiB (the file cache and this process have the rest). A job
 # past it is stopped while there is still an instance to answer with: one that runs the box out
 # of memory takes its reply, and the timeout that would have ended it, down too.
-MEM_MAX = 5 * 2**30
-MAX_IN = 110_000_000        # the SDK sends at most 100 MB of meshes + images, plus the scene
-MAX_OUT = 160_000_000       # an import's meshes come back as base64 sidecars, a third bigger
+MEM_MAX = 22 * 2**30                   # Bonafide: was 5 GiB of an 8 GiB box; now of 32 GiB
+MAX_IN = 520_000_000        # the SDK sends at most 500 MB of meshes + images, plus the scene (Bonafide: was 110)
+MAX_OUT = 700_000_000       # an import's meshes come back as base64 sidecars, a third bigger (Bonafide: was 160)
 _BLOB_NAME = (r"^(meshes/m-[0-9a-f]{12}\.json|textures/t-[0-9a-f]{12}\.(png|jpg)"
               r"|import\.(glb|gltf|obj|fbx|stl|ply|blend)|texture_in\.(png|jpg|jpeg|webp|bmp|tif|tiff|tga|exr|hdr)"
               r"|segments/s-\d{3}\.mp4)"
@@ -534,6 +534,6 @@ def render(config: dict = None, *, op: str = None, scene: dict = None, blobs: di
 
 
 if cycls:
-    render = cycls.function(name="cycls-render", image=image, cpu=8, memory="8Gi",
-                            timeout=900, concurrency=1)(render)
+    render = cycls.function(name="bonafide-studio", image=image, cpu=8, memory="32Gi",
+                            timeout=1800, concurrency=1)(render)
     render.spec["max_instances"] = 4     # cost ceiling; the decorator doesn't expose it
