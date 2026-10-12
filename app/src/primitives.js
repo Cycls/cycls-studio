@@ -69,7 +69,12 @@ export function bufferGeometry({ positions, normals, uv, index, triMat }) {
   if (normals) g.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
   if (uv) g.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
   if (triMat && triMat.length && triMat.some((x) => x)) {
-    const slots = Math.max(...triMat) + 1, sorted = new Uint32Array(index.length);
+    // A loop, not Math.max(...triMat): spreading one argument per triangle
+    // overflows the stack past 65,536 in Safari (~125,000 in Chrome), and a
+    // venue mesh has more — the whole app stopped on a 66,192-triangle mesh.
+    let top = 0;
+    for (let t = 0; t < triMat.length; t++) if (triMat[t] > top) top = triMat[t];
+    const slots = top + 1, sorted = new Uint32Array(index.length);
     let at = 0;
     for (let slot = 0; slot < slots; slot++) {
       const start = at;
