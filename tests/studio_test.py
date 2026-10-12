@@ -101,7 +101,8 @@ class FakeEngine:
                 return {"ok": True, "result": {"scene": doc, "notes": ["curve baked"], "stdout": "hello\n"},
                         "files": {}}
             if op == "import":
-                frag = S.normalize({"objects": {"cube": {"type": "mesh", "mesh": "m-aaaaaaaaaaaa"}},
+                frag = S.normalize({"objects": {"cube": {"type": "mesh", "mesh": "m-aaaaaaaaaaaa"},
+                                                **getattr(self, "import_objects", {})},
                                     "meshes": {"m-aaaaaaaaaaaa": {"data": "meshes/m-aaaaaaaaaaaa.json"}}})
                 return {"ok": True, "result": {"scene": frag, "notes": [], **getattr(self, "import_extra", {})},
                         "files": {"meshes_out/m-aaaaaaaaaaaa.json": b'{"format": "cycls.mesh"}'}}
@@ -609,6 +610,89 @@ class TestRoute:
         codes = [client.post("/apps/studio/engine", json={"op": "snapshot"}).status_code for _ in range(4)]
         assert codes == [200, 200, 200, 429]
 
+    # ─── a .blend opened from Files ───
+
+    def _open(self, client, path, mode):
+        return client.post("/apps/studio/engine", json={"op": "open_file", "params": {"path": path, "mode": mode}})
+
+    def test_a_file_opens_in_place_of_the_scene(self, client, root, engine):
+        (root / "models").mkdir()
+        (root / "models/venue.blend").write_bytes(b"BLENDER")
+        engine.import_extra = {"world": {"kind": "hdri", "hdri": "courtyard", "strength": 1.0}, "camera": "shot"}
+        engine.import_objects = {"shot": {"type": "camera", "location": [0, -8, 2]}}
+        run({"action": "edit", "ops": [{"op": "render", "resolution": [800, 600]}]}, root)
+        before = scene(root)
+        r = self._open(client, "models/venue.blend", "replace").json()
+        doc = scene(root)
+        assert engine.calls[-1]["op"] == "import" and engine.calls[-1]["blobs"] == {"import.blend": b"BLENDER"}
+        assert r == {"ok": True, "rev": doc["rev"], "added": 2, "camera": "shot", "notes": []}
+        # The file's objects under their own names (nothing here to collide with), seen through its camera,
+        # under its world; the Studio's render settings stay.
+        assert set(doc["objects"]) == {"cube", "shot"} and doc["objects"]["cube"]["mesh"] == "m-aaaaaaaaaaaa"
+        assert set(doc["meshes"]) == {"m-aaaaaaaaaaaa"} and doc["materials"] == {}
+        assert doc["render"]["camera"] == "shot" and doc["render"]["resolution"] == [800, 600]
+        assert doc["world"]["hdri"] == "courtyard" and doc["by"] == "app" and doc["rev"] == before["rev"] + 1
+        # The scene it replaced is a revert away.
+        kept = json.loads((root / "apps/studio/data/history" / f"{before['rev']}.json").read_text())
+        assert set(kept["objects"]) == {"cube", "light", "camera"}
+        assert "Restored" in _text(run({"action": "revert", "rev": before["rev"]}, root))
+        assert set(scene(root)["objects"]) == {"cube", "light", "camera"}
+
+    def test_a_file_is_added_to_the_scene(self, client, root, engine):
+        (root / "venue.blend").write_bytes(b"BLENDER")
+        r = self._open(client, "venue.blend", "add").json()
+        doc = scene(root)
+        assert r["added"] == 1 and set(doc["objects"]) == {"cube", "light", "camera", "cube_2"}
+        assert doc["render"]["camera"] == "camera"                       # the scene's own shot stays
+        assert not (root / "apps/studio/data/source.json").exists()      # the scene isn't that file
+
+    def test_what_cant_be_opened_is_said(self, client, root, engine):
+        (root / "notes.txt").write_text("x")
+        (root / "venue.blend").write_bytes(b"BLENDER")
+        assert self._open(client, "notes.txt", "replace").json()["error"].startswith("import takes")
+        assert self._open(client, "gone.blend", "replace").json() == {"ok": False, "error": "gone.blend does not exist."}
+        assert self._open(client, "../venue.blend", "replace").json()["ok"] is False        # outside the workspace
+        for mode in (None, "merge"):
+            assert self._open(client, "venue.blend", mode).status_code == 400
+        engine.fail = "Blender couldn't read that file"
+        assert self._open(client, "venue.blend", "replace").json() == {"ok": False, "error": "Blender couldn't read that file"}
+        assert set(scene(root)["objects"]) == {"cube", "light", "camera"}    # nothing was touched
+
+    def test_the_extension_says_which_app_and_whether_its_already_open(self, client, root, engine):
+        studio = cycls_studio.Studio()
+        assert studio.opens() == ("blend",)
+        (root / "venue.blend").write_bytes(b"BLENDER")
+        ws = _ws(root)
+        made = asyncio.run(studio.open(ws, "venue.blend"))
+        assert made == {"app": "apps/studio/index.html", "changed": False,
+                        "command": {"type": "open_file", "path": "venue.blend", "name": "venue.blend", "same": False}}
+        self._open(client, "venue.blend", "replace")
+        assert asyncio.run(studio.open(ws, "venue.blend"))["command"]["same"] is True
+        # Edited, it is still that file; a scene built anew is not, and neither is a file that changed.
+        run({"action": "edit", "ops": [{"op": "add", "id": "ball", "primitive": "uv_sphere"}]}, root)
+        assert asyncio.run(studio.open(ws, "venue.blend"))["command"]["same"] is True
+        run({"action": "edit", "ops": [{"op": "delete", "id": "cube"}]}, root)
+        assert asyncio.run(studio.open(ws, "venue.blend"))["command"]["same"] is False
+        self._open(client, "venue.blend", "replace")
+        (root / "venue.blend").write_bytes(b"BLENDER, saved again")
+        assert asyncio.run(studio.open(ws, "venue.blend"))["command"]["same"] is False
+        with pytest.raises(ValueError, match="import takes"):
+            asyncio.run(studio.open(ws, "apps/studio/app.json"))
+
+    def test_opening_a_file_puts_the_studio_into_a_workspace_without_it(self, tmp_path, engine):
+        root = tmp_path / "fresh"
+        root.mkdir()
+        (root / "venue.blend").write_bytes(b"BLENDER")
+        made = asyncio.run(cycls_studio.Studio().open(_ws(root), "venue.blend"))
+        assert made["changed"] is True and (root / "apps/studio/index.html").exists()
+        (root / "apps/other").mkdir()
+        other = tmp_path / "taken"
+        (other / "apps/studio").mkdir(parents=True)
+        (other / "apps/studio/index.html").write_text("<html>someone else's</html>")
+        (other / "venue.blend").write_bytes(b"BLENDER")
+        with pytest.raises(ValueError, match="another app"):
+            asyncio.run(cycls_studio.Studio().open(_ws(other), "venue.blend"))
+
 
 # ─── video ──────────────────────────────────────────────────────────────────
 
@@ -802,3 +886,34 @@ def test_route_mounts_only_when_configured(monkeypatch):
 def test_bundle_carries_its_own_csp():
     html = install.bundle()[0]
     assert "connect-src 'none'" in html and "Content-Security-Policy" in html
+
+
+@pytest.mark.skipif(not hasattr(cycls.Extension, "opens"), reason="needs an SDK whose extensions can open files")
+def test_a_blend_clicked_in_files_reaches_the_studio(tmp_path, engine):
+    """The SDK's side of the seam: /config names .blend as the Studio's, and POST /apps/open
+    installs the app and hands back what the host tells it."""
+    from fastapi import Depends, FastAPI
+    from fastapi.testclient import TestClient
+    from cycls._agent.web import routers
+    from cycls._agent.web.server import Config
+
+    class _App:
+        config = None
+        connectors = None
+        extensions = [cycls_studio.Studio()]
+    app = FastAPI()
+    routers.install_routers(_App(), app, Depends(lambda: cycls.User(id="u1")), tmp_path, f"file://{tmp_path}")
+    assert Config().public()["opens"] == {"blend": "Studio"}
+    root = workspace(cycls.User(id="u1"), tmp_path, base=f"file://{tmp_path}").root
+    (root / "models").mkdir(parents=True)
+    (root / "models/venue.blend").write_bytes(b"BLENDER")
+    c = TestClient(app)
+    r = c.post("/apps/open", json={"path": "models/venue.blend"}).json()
+    assert r == {"app": "apps/studio/index.html", "name": "Studio", "changed": True,
+                 "command": {"type": "open_file", "path": "models/venue.blend", "name": "venue.blend", "same": False}}
+    assert (root / "apps/studio/index.html").exists()
+    # The app, told, asks the route — the one the same server mounted.
+    assert c.post("/apps/studio/engine", json={"op": "open_file", "params": {"path": r["command"]["path"],
+                                                                             "mode": "replace"}}).json()["added"] == 1
+    assert c.post("/apps/open", json={"path": "models/venue.blend"}).json()["command"]["same"] is True
+    assert c.post("/apps/open", json={"path": "models/venue.blend"}).json()["changed"] is False

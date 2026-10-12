@@ -12,6 +12,7 @@ node dev/driver.mjs                             # headless Chrome on the host pa
 dev/drive.sh - < dev/checks/drag.js             # select, drag the gizmo, check the autosave
 dev/drive.sh - < dev/checks/edit.js             # Edit mode: Tab, pick the top face, inset, extrude
 dev/drive.sh - < dev/checks/tools.js            # loop cut, knife, proportional, snapping, Blender round trip
+dev/drive.sh - < dev/checks/open.js             # a .blend opened from Files: held, asked about, added, opened, undone
 uv run --with pillow python dev/compare.py dev/shots/probe.png <cycles.png> dev/shots/cmp.png
 ```
 
@@ -23,3 +24,6 @@ uv run --with pillow python dev/compare.py dev/shots/probe.png <cycles.png> dev/
   the chat's canvas does while it slides open.
 - `window.__studio` is the app controller inside the frame (`evalApp`); `window.__log`
   and `window.__push(command)` (an agent `app_command`) live in the host page (`evalHost`).
+- `window.__open(path)` hands the app a file as the chat does for one opened from Files, and
+  `?open=<path>` on the host URL does it before the frame is up (the command is held for it).
+  Both need an SDK checkout whose bridge has `sendAppCommand`.

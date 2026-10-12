@@ -611,6 +611,21 @@ function VideoBar({ v, a }) {
 
 // ─── shell ───────────────────────────────────────────────────────────────────
 
+// A file from the workspace, opened into a Studio that already holds a scene.
+function OpenDialog({ file, a }) {
+  return <div class="scrim" onClick={a.cancelOpen}>
+    <div class="dialog" role="dialog" aria-label={`Open ${file.name}`} onClick={(e) => e.stopPropagation()}>
+      <b>Open {file.name}</b>
+      <p>The Studio holds one scene. Open the file in its place, or add it to this one. Undo brings this scene back.</p>
+      <div class="dialog-actions">
+        <button onClick={a.cancelOpen}>Cancel</button>
+        <button onClick={() => a.openModel("add")}>Add to the scene</button>
+        <button class="primary" onClick={() => a.openModel("replace")}>Open</button>
+      </div>
+    </div>
+  </div>;
+}
+
 export function Studio({ app }) {
   const s = useApp(app);
   const a = app.actions;
@@ -632,7 +647,7 @@ export function Studio({ app }) {
     <div class="body">
       {panels && s.doc && <Outliner s={s} a={a} />}
       <div class="viewport" ref={host}>
-        {s.busy && <div class="busy"><span class="spin" /><span>{s.busy}</span>{s.progress && <Progress p={s.progress} />}</div>}
+        {s.busy && !s.locked && <div class="busy"><span class="spin" /><span>{s.busy}</span>{s.progress && <Progress p={s.progress} />}</div>}
         {s.video && <VideoBar v={s.video} a={a} />}
         {!s.engine && s.doc && <div class="hint">Open the Studio from the chat to render and use Blender's tools.</div>}
         <button class="panels-toggle" onClick={() => setPanels(!panels)}>{panels ? "⤢" : "☰"}</button>
@@ -647,6 +662,9 @@ export function Studio({ app }) {
       {panels && s.doc && <Properties s={s} a={a} />}
     </div>
     {s.doc && <Timeline s={s} a={a} />}
+    {s.opening && <OpenDialog file={s.opening} a={a} />}
+    {s.locked && <div class="scrim"><div class="opening"><span class="spin" /><span>{s.busy}</span>
+      <small>A large file can take a minute or two.</small></div></div>}
     {s.toast && <div class={`toast ${s.toast.kind}`}>{s.toast.text}</div>}
   </div>;
 }

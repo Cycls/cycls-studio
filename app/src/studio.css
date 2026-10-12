@@ -96,6 +96,14 @@ input[type=checkbox] { accent-color: var(--blue); }
 .toast { position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%); background: #2d2d2d; border: 1px solid #555;
   padding: 7px 14px; border-radius: 6px; z-index: 40; max-width: 80%; box-shadow: 0 6px 20px #000a; }
 .toast.error { border-color: #a4473d; background: #3a2220; } .toast.warn { border-color: #a38a3d; }
+.scrim { position: fixed; inset: 0; background: #000a; z-index: 30; display: flex; align-items: center; justify-content: center; }
+.dialog { background: var(--panel); border: 1px solid #555; border-radius: 8px; padding: 16px; width: min(400px, 90vw);
+  box-shadow: 0 10px 30px #000c; display: flex; flex-direction: column; gap: 10px; }
+.dialog p { margin: 0; color: var(--muted); line-height: 1.45; }
+.dialog-actions { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
+.opening { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: center; color: #fff;
+  background: #000c; padding: 10px 16px; border-radius: 18px; max-width: 90vw; }
+.opening small { color: var(--muted); flex-basis: 100%; text-align: center; }
 @media (max-width: 760px) { .header .mode, .header .status { display: none; } }
 .image-slot { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .image-slot .muted { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 90px; font-size: 11px; }

@@ -1,6 +1,6 @@
 // The controller: the document, its history, and keeping it in step with disk,
 // the agent, the viewport and Blender.
-import { SCHEMA, clone, deepEqual, merge3, patch, addObject, duplicate, remove, make, newId, isBackdrop,
+import { SCHEMA, SECTIONS, clone, deepEqual, merge3, patch, addObject, duplicate, remove, make, newId, isBackdrop,
          hasTexture, pruneTextures } from "./doc.js";
 import * as bridge from "./bridge.js";
 import * as M from "./mesh.js";
@@ -51,6 +51,7 @@ export function createApp(viewportFactory) {
     mode: "object", edit: null, editMesh: null, tools: { ...TOOL_DEFAULTS },
     tool: null, proportional: { on: false, radius: 1, falloff: "smooth" }, snap: false, snapTarget: "increment", lastCut: null,
     frame: 1, playing: false, autokey: false, video: null,
+    opening: null, locked: false,          // a file from the workspace: asked about, then being opened
   };
   const emit = () => { diag.status = s.status; diag.selection = s.selection; diag.mode = s.mode; listeners.forEach((f) => f(s)); };
   const set = (p) => { Object.assign(s, p); emit(); };
@@ -191,6 +192,66 @@ export function createApp(viewportFactory) {
       driveVideo(cmd.job);                          // the agent started one: this tab renders it
     } else if (cmd.type === "render_done" || cmd.type === "snapshot") {
       set({ preview: { src: cmd.preview, path: cmd.path || null, kind: cmd.type === "snapshot" ? "Snapshot" : "Render" } });
+    } else if (cmd.type === "open_file" && typeof cmd.path === "string") {
+      openFrom(cmd);
+    }
+  }
+
+  // ─── a file opened from the workspace ──────────────────────────────────────
+
+  // The scene every Studio starts with: nothing of anyone's is in it yet.
+  const untouched = (doc) => SECTIONS.every((sec) => deepEqual(doc[sec], SCHEMA.new_scene[sec]));
+
+  // A .blend opened from Files (the host hands over its path). Into an untouched Studio it
+  // just opens. A scene someone made is theirs to replace or add to, so they're asked — and
+  // the file this scene already came from only brings the Studio forward.
+  function openFrom(cmd) {
+    const name = typeof cmd.name === "string" && cmd.name ? cmd.name : cmd.path.split("/").pop();
+    if (s.locked) { toast("Still opening the last file…", "warn"); return; }
+    if (!bridge.canEngine()) { toast("Opening a file needs the Blender engine", "error"); return; }
+    if (untouched(s.doc)) { openModel({ path: cmd.path, name }, "replace"); return; }
+    if (cmd.same) { toast(`${name} is already open`); return; }
+    set({ opening: { path: cmd.path, name } });
+  }
+
+  // What's unsaved goes to disk first: the server opens the file onto the scene it finds there.
+  async function saveNow() {
+    clearTimeout(saveTimer);
+    for (let i = 0; i < 100 && saving; i++) await new Promise((r) => setTimeout(r, 50));
+    if (s.status === "unsaved") await save();
+  }
+
+  // Blender reads the file (seconds for a model, minutes for a site): in place of the
+  // scene, or added to it. Nothing is edited meanwhile — the scene is about to change under
+  // it — and the scene it replaced is one undo away.
+  async function openModel(file, mode) {
+    if (!file || s.locked) return;
+    const { path, name } = file;
+    if (s.mode === "edit") leaveEdit();
+    set({ opening: null, locked: true, busy: `Opening ${name} with Blender…` });
+    try {
+      await saveNow();
+      const before = s.doc;
+      await engine("open_file", { params: { path, mode } });
+      const disk = await bridge.readScene();
+      s.undo = [...s.undo.slice(-undoLimit(before) + 1), { doc: before, label: `Open ${name}` }];
+      s.redo = [];
+      s.selection = [];
+      if (mode === "replace") {                       // the scene is the file now: nothing of the old one to merge
+        s.base = clone(disk);
+        s.doc = disk;
+        s.frame = disk.animation.frame_start;
+        set({ status: "saved" });
+        show();
+      } else {
+        absorb(disk, "on disk");
+      }
+      if (!(mode === "replace" && s.doc.render.camera && vp.throughCamera(shown()))) vp.frame(subjects());
+      toast(mode === "replace" ? `Opened ${name}` : `Added ${name} to the scene`);
+    } catch (e) {
+      toast(`Couldn't open ${name}: ${e.message}`, "error");
+    } finally {
+      set({ busy: null, locked: false });
     }
   }
 
@@ -1055,6 +1116,9 @@ export function createApp(viewportFactory) {
     async renders() {
       try { const r = await bridge.readJSON("renders.json"); return Array.isArray(r) ? r : []; } catch { return []; }
     },
+    // The answer to "open this file?": in place of the scene ("replace"), added to it ("add"), or not.
+    openModel(mode) { return openModel(s.opening, mode); },
+    cancelOpen() { set({ opening: null }); },
     // A render (or export) on the chat's canvas — the host opens it; the route checks it's ours.
     async openFile(path) {
       try { await bridge.engine("open", { params: { path } }); } catch (e) { toast(e.message, "error"); }

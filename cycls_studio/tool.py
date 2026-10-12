@@ -473,44 +473,74 @@ async def _script(ws, inp):
     return {"_model": ack, "_ui": event}
 
 
-async def _import(ws, inp):
+def model_file(ws, given):
+    """The model file someone named, in the workspace: (its path, its extension). Raises
+    SceneError with what's wrong with it."""
     try:
-        path = resolve_path(inp.get("path", ""), ws.root)
+        path = resolve_path(given or "", ws.root)
     except ValueError as e:
-        return f"Error: {e}"
+        raise S.SceneError(str(e)) from None
     ext = path.suffix.lower().lstrip(".")
     if ext not in IMPORT_EXTS:
-        return f"Error: import takes {', '.join(IMPORT_EXTS)} files."
+        raise S.SceneError(f"import takes {', '.join(IMPORT_EXTS)} files.")
     if not path.is_file():
-        return f"Error: {inp.get('path')} does not exist."
+        raise S.SceneError(f"{given} does not exist.")
     if path.stat().st_size > MAX_IMPORT:
-        return f"Error: that file is over {MAX_IMPORT // 1_000_000} MB."
+        raise S.SceneError(f"that file is over {MAX_IMPORT // 1_000_000} MB.")
+    return path, ext
+
+
+def _cleared(doc):
+    """The scene with nothing in it — where a file is opened. Its render settings stay."""
+    fresh = S.new_scene()
+    return S.normalize({**doc, "objects": {}, "meshes": {}, "materials": {}, "textures": {},
+                        "world": fresh["world"], "animation": fresh["animation"],
+                        "render": {**doc["render"], "camera": None}})
+
+
+async def bring_in(ws, path, ext, *, replace=False, by="agent"):
+    """Blender reads a model file into the scene: added to what is there, or (`replace`) in
+    its place — a file opened, with its world, its timeline and its camera. Returns
+    {saved, event, added, said, notes, camera}."""
     data = await asyncio.to_thread(path.read_bytes)
     r = await engine.call("import", {}, blobs={f"import.{ext}": data}, params={"ext": ext})
     res = r["result"]
     _write_outputs(ws, r["files"])
     async with store.lock(ws):
         before = await store.load(ws)
+        base = _cleared(before) if replace else before
         frag = res["scene"]
         frag["render"] = {**frag["render"], "camera": None}
-        after, added = S.merge_fragment(before, frag)
+        after, added = S.merge_fragment(base, frag)
         said = []
         # The file's world, when this scene's is still the Studio's default; its camera, named.
-        if res.get("world") and before["world"] == S.new_scene()["world"]:
+        if res.get("world") and base["world"] == S.new_scene()["world"]:
             after = S.normalize({**after, "world": {**after["world"], **res["world"]}})
             said.append("took the file's world")
         # Its timeline, for its keys — when nothing here moves yet.
-        if res.get("animation") and S.animated(after) and not S.animated(before):
+        if res.get("animation") and S.animated(after) and not S.animated(base):
             after = S.normalize({**after, "animation": res["animation"]})
             a = after["animation"]
             said.append(f"its animation came along (frames {a['frame_start']}–{a['frame_end']} at {a['fps']} fps)")
         cam = dict(zip(frag["objects"], added)).get(res.get("camera"))
-        if cam:
+        if cam and replace and after["objects"][cam]["type"] == "camera":   # a file opened is seen through its own camera
+            after = S.normalize({**after, "render": {**after["render"], "camera": cam}})
+        elif cam:
             said.append(f"the file's camera is {cam!r} — `render {{camera: \"{cam}\"}}` looks through it")
-        saved, event = await _save(ws, before, after, f"import {path.name}")
+        saved = await store.save(ws, after, before, by=by)
+        event = _patch_event(before, saved, f"{'open' if replace else 'import'} {path.name}")
+    return {"saved": saved, "event": event, "added": added, "said": said, "notes": res.get("notes") or [],
+            "camera": cam}
+
+
+async def _import(ws, inp):
+    path, ext = model_file(ws, inp.get("path"))
+    got = await bring_in(ws, path, ext)
+    added, said = got["added"], got["said"]
     return {"_model": f"Imported {inp.get('path')}: added {len(added)} object(s) — {', '.join(added[:15])} "
-                      f"(rev {saved['rev']})." + (" " + "; ".join(said) + "." if said else "") + _notes(res.get("notes")),
-            "_ui": event}
+                      f"(rev {got['saved']['rev']})." + (" " + "; ".join(said) + "." if said else "")
+                      + _notes(got["notes"]),
+            "_ui": got["event"]}
 
 
 async def _export(ws, inp):

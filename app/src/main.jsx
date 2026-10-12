@@ -16,6 +16,9 @@ addEventListener("keydown", (e) => {
   if (!s.doc) return;
   const k = e.code, ctrl = e.ctrlKey || e.metaKey;
   const handled = () => { e.preventDefault(); e.stopPropagation(); };
+  // A file is being asked about, or opened: the scene's keys wait.
+  if (s.opening) { if (k === "Escape") { a.cancelOpen(); handled(); } return; }
+  if (s.locked) return;
   if (s.playing && k === "Escape") { a.pause(true); return handled(); }
   if (ctrl && k === "KeyZ") { e.shiftKey ? a.redo() : a.undo(); return handled(); }
   if (ctrl && k === "KeyY") { a.redo(); return handled(); }

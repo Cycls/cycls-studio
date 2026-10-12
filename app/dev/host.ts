@@ -1,9 +1,10 @@
 // A stand-in for the chat host: the real shim + the real bridge, the real Studio
 // bundle, and a tiny server for files + the real studio_router.
 import { injectShim } from "@client/components/app-shim";
-import { attachBridge, APP_COMMAND_EVENT } from "@client/components/app-bridge";
+import { attachBridge, sendAppCommand } from "@client/components/app-bridge";
 
-declare global { interface Window { __log: unknown[]; __appData: Record<string, unknown>; __push: (c: unknown) => void; __asks: string[] } }
+declare global { interface Window { __log: unknown[]; __appData: Record<string, unknown>; __push: (c: unknown) => void; __open: (path: string, same?: boolean) => void; __asks: string[] } }
+const APP = "apps/studio/index.html";
 window.__log = [];
 window.__appData = {};
 window.__asks = [];
@@ -14,7 +15,7 @@ async function main() {
   const frame = document.getElementById("app") as HTMLIFrameElement;
   attachBridge({
     frame,
-    appPath: "apps/studio/index.html",
+    appPath: APP,
     readFile: async (p) => {
       const r = await fetch(`/files/${p}`);
       log("read", p, r.status);
@@ -51,7 +52,13 @@ async function main() {
   });
   const late = new URLSearchParams(location.search).get("late");
   if (late) { frame.style.width = "0px"; frame.style.height = "0px"; setTimeout(() => { frame.style.width = ""; frame.style.height = ""; }, +late); }
+  // A file opened from Files, as the chat hands it over: held for an app that isn't up yet.
+  // `?open=<path>` sends it before the frame exists, as a click that also opens the Studio does.
+  window.__open = (path, same = false) =>
+    sendAppCommand(APP, { type: "open_file", path, name: path.split("/").pop(), same }, { hold: true });
+  const open = new URLSearchParams(location.search).get("open");
+  if (open) window.__open(open);
   frame.srcdoc = injectShim(html);
-  window.__push = (command) => dispatchEvent(new CustomEvent(APP_COMMAND_EVENT, { detail: { path: "apps/studio/index.html", command } }));
+  window.__push = (command) => sendAppCommand(APP, command);
 }
 main();
