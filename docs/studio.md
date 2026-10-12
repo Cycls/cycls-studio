@@ -262,6 +262,34 @@ One op never reaches the engine: `open {path}` answers `{open: path}` for a rend
 a file under `exports/`, and the host bridge opens it on the canvas (the Renders list, the preview's
 Open). The `video_*` ops are the video jobs above.
 
+## A .blend opened from Files
+
+A `.blend` in the workspace opens in the Studio, where a click used to download it. Three hands:
+
+- **The SDK** asks the extension. `Studio.opens()` claims `blend`, so the agent's `/config` tells
+  the browser, and a click on one posts `/apps/open`. `Studio.open(ws, path)` installs the app if
+  the workspace never had it, and answers the app to show and the command to hand it:
+  `{type: "open_file", path, name, same}`. The host holds the command until the app's channel is
+  up (docs/notes/apps.md in the SDK), so a click that also opens the Studio loses nothing.
+- **The app** decides what opening means, because it holds one scene. Into the scene every
+  Studio starts with, the file just opens. A scene someone made is theirs: the app asks —
+  *Open* (in place of the scene), *Add to the scene*, or *Cancel*. `same` (the scene is still
+  this file) only brings the Studio forward, with a word.
+- **The route** does it: `open_file {path, mode: "replace" | "add"}`. It is the tool's import
+  (`tool.bring_in`: one engine `import`, the mesh and image files written, the scene saved under
+  its lock with the one it replaced in history), so the model file is checked the same way —
+  inside the workspace, a model type, at most 100 MB. `replace` starts from an empty scene that
+  keeps the Studio's render settings, takes the file's world and timeline, and looks through
+  its camera; `add` is an import. The app saves what's unsaved first, waits behind a scrim
+  (nothing is edited while the scene is about to change), reads the scene again, and puts the
+  scene it had on its undo stack.
+
+`data/source.json` notes the file a scene was opened from — its path, size and time, and the ids
+that came from it. `same` needs all three to match and at least half of those objects still in
+the scene: a scene cleared and built anew is not the file, whatever was opened last. Only
+`.blend` is claimed; `glb` and `gltf` are the canvas's own viewer, and the other model types
+still come in through the tool's `import`.
+
 ## The app
 
 Preact and three.js core with its add-ons (OrbitControls, TransformControls, RectAreaLight),
@@ -496,7 +524,8 @@ carried. The tool counts material notes for the model rather than listing dozens
   bridge: merging, saving, Edit mode, Apply, Blender's selection carried on, keying, the video loop).
 - The viewport itself needs WebGL, so it's checked in a browser: the real host, or headless Chrome
   driving the built bundle through the real shim, bridge and route (gizmo drag and autosave, the
-  Render button, Edit mode, and screenshots of Material Preview against a Cycles render).
+  Render button, Edit mode, a file opened from Files — `app/dev/checks/open.js` — and screenshots
+  of Material Preview against a Cycles render).
 - In the SDK: `client/tests/app-bridge.test.ts`, `app-shim.test.ts` — `engine`, `onCommand`, `ask`;
   `tests/agent/extension_test.py` — the hook itself.
 - The engine's own: `studio_try.py dev|remote selftest evaluate …` round-trips every object type

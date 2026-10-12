@@ -543,3 +543,80 @@ describe("animation in the app", () => {
     expect(s.video).toMatchObject({ id: "v-0000cafe", total: 120, seconds_left: 400 });
   });
 });
+
+describe("a file opened from the workspace (a .blend clicked in Files)", () => {
+  // What the route does: Blender reads the file, the scene is saved — in its place, or added.
+  const serverOpens = (h) => h.onEngine((op, payload, files) => {
+    const disk = JSON.parse(files.get("data/scene.json"));
+    const venue = { ...clone(SCHEMA.new_scene.objects.cube), name: "Venue", location: [9, 9, 0] };
+    const next = payload.params.mode === "replace"
+      ? { ...disk, objects: { venue }, meshes: { cube: disk.meshes.cube ?? clone(SCHEMA.new_scene.meshes.cube) },
+          render: { ...disk.render, camera: null } }
+      : { ...disk, objects: { ...disk.objects, venue } };
+    files.set("data/scene.json", JSON.stringify({ ...next, rev: disk.rev + 1, by: "app" }));
+    return { ok: true, rev: disk.rev + 1, added: 1 };
+  });
+  const open = { type: "open_file", path: "models/venue.blend", name: "venue.blend", same: false };
+
+  it("into an untouched Studio it just opens, and undo brings the scene back", async () => {
+    const { h, a, s, vp } = await started(scene());
+    serverOpens(h);
+    const framed = vi.spyOn(vp, "frame");
+    h.send(open);
+    expect(s.locked).toBe(true);
+    expect(s.busy).toBe("Opening venue.blend with Blender…");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(h.engineCalls.at(-1)).toEqual({ op: "open_file", payload: { params: { path: "models/venue.blend", mode: "replace" } } });
+    expect(Object.keys(s.doc.objects)).toEqual(["venue"]);
+    expect(s).toMatchObject({ locked: false, busy: null, opening: null, status: "saved" });
+    expect(s.toast.text).toBe("Opened venue.blend");
+    expect(framed).toHaveBeenCalled();
+    expect(s.undo.at(-1).label).toBe("Open venue.blend");
+    a.undo();
+    expect(Object.keys(s.doc.objects).sort()).toEqual(["camera", "cube", "light"]);
+  });
+
+  it("a scene someone made is asked about: replaced, added to, or left", async () => {
+    const { h, a, s } = await started(scene());
+    serverOpens(h);
+    a.update((d) => { d.objects.cube.location = [2, 0, 1]; }, "move");
+    h.send(open);
+    expect(s.opening).toEqual({ path: "models/venue.blend", name: "venue.blend" });
+    expect(h.engineCalls).toEqual([]);
+    a.cancelOpen();
+    expect(s.opening).toBeNull();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(h.engineCalls).toEqual([]);
+
+    h.send(open);
+    a.openModel("add");
+    await vi.advanceTimersByTimeAsync(1);
+    // The move was saved before the server opened the file onto it.
+    expect(h.engineCalls.at(-1).payload.params.mode).toBe("add");
+    expect(s.doc.objects.cube.location).toEqual([2, 0, 1]);
+    expect(Object.keys(s.doc.objects).sort()).toEqual(["camera", "cube", "light", "venue"]);
+    expect(s.toast.text).toBe("Added venue.blend to the scene");
+
+    h.send(open);
+    a.openModel("replace");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(Object.keys(s.doc.objects)).toEqual(["venue"]);
+  });
+
+  it("the file the scene came from only brings the Studio forward; a failure says so", async () => {
+    const { h, a, s } = await started(scene());
+    a.update((d) => { d.objects.cube.location = [2, 0, 1]; }, "move");
+    h.send({ ...open, same: true });
+    expect(s.opening).toBeNull();
+    expect(s.toast.text).toBe("venue.blend is already open");
+    expect(h.engineCalls).toEqual([]);
+
+    h.onEngine(() => ({ ok: false, error: "that file is over 100 MB." }));
+    h.send(open);
+    a.openModel("replace");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(s.toast).toEqual({ text: "Couldn't open venue.blend: that file is over 100 MB.", kind: "error" });
+    expect(s.locked).toBe(false);
+    expect(s.doc.objects.cube.location).toEqual([2, 0, 1]);
+  });
+});

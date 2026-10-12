@@ -48,3 +48,20 @@ class Studio(Extension):
     def router(self, workspace, user):
         from .route import studio_router
         return studio_router(workspace, user)
+
+    def opens(self):
+        return ("blend",)
+
+    async def open(self, workspace, path):
+        """A .blend opened from Files: the Studio is put into the workspace if it isn't there,
+        and told the file. The app asks before it replaces a scene; `same` says the scene is
+        already this file, so it only comes forward."""
+        from . import install, store, tool
+        try:
+            installed = await install.ensure_installed(workspace)
+            file, _ = tool.model_file(workspace, path)
+            same = store.is_open(workspace, path, file, await store.load(workspace))
+        except (install.InstallError, tool.S.SceneError) as e:
+            raise ValueError(str(e)) from None
+        return {"app": tool.APP_ENTRY, "changed": installed is not None,
+                "command": {"type": "open_file", "path": path, "name": file.name, "same": same}}

@@ -109,6 +109,35 @@ async def save(ws, doc, previous, by="agent"):
     return await asyncio.to_thread(_write, ws, S.normalize(doc), previous, by)
 
 
+SOURCE = f"{APP_DIR}/data/source.json"
+
+
+def _stamp(path):
+    st = path.stat()
+    return {"size": st.st_size, "modified": int(st.st_mtime)}
+
+
+def opened(ws, rel, path, ids):
+    """Note the file the scene was opened from (a .blend opened in the Studio), as it was
+    then, and the objects that came from it."""
+    out = _root(ws) / SOURCE
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({"path": rel, **_stamp(path), "objects": list(ids)}), encoding="utf-8")
+
+
+def is_open(ws, rel, path, doc):
+    """Is the scene still that file, as it is now? The same file, unchanged since it was
+    opened, and at least half of what came from it still here — a scene that was cleared and
+    built anew is not the file any more, whatever was opened last."""
+    try:
+        was = json.loads((_root(ws) / SOURCE).read_text(encoding="utf-8"))
+        ids = was["objects"]
+        return (was["path"] == rel and {k: was[k] for k in ("size", "modified")} == _stamp(path)
+                and len(ids) > 0 and 2 * sum(i in doc["objects"] for i in ids) >= len(ids))
+    except Exception:
+        return False
+
+
 def history(ws, rev):
     path = _root(ws) / APP_DIR / "data" / "history" / f"{int(rev)}.json"
     if not path.exists():

@@ -3,7 +3,8 @@
 A Blender-style 3D studio for any [Cycls](https://github.com/Cycls/cycls) agent. The agent builds
 a scene from a sentence and renders it with real Blender (Cycles). The person opens the same scene
 as an app on the canvas, with an outliner, a viewport, Object and Edit modes, modifiers, materials,
-a timeline and a Render button. What either side changes, the other sees.
+a timeline and a Render button. What either side changes, the other sees. A `.blend` in the
+workspace opens in it from Files.
 
 ## Add it to an agent
 

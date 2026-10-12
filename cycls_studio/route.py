@@ -16,7 +16,7 @@ import time
 
 from fastapi import APIRouter, HTTPException, Request
 
-from . import APP_DIR, SLUG, engine, store, video
+from . import APP_DIR, SLUG, engine, store, tool, video
 from . import scene as S
 from .tool import EXPORT_EXTS, _free, _slug
 
@@ -103,6 +103,27 @@ async def _open(ws, body):
     return {"ok": True, "open": path}
 
 
+async def _open_file(ws, body):
+    """A model file of the workspace, opened from the Studio (a .blend clicked in Files, the
+    person asked which way): `replace` puts it in place of the scene — the one it replaced is
+    kept in history, and the app's undo holds it — and `add` brings it into the scene. It is
+    saved as the tool's import saves; the app reads the scene again."""
+    params = body.get("params") or {}
+    if not isinstance(params, dict) or params.get("mode") not in ("replace", "add"):
+        raise HTTPException(400, "params: {path, mode: replace | add}")
+    replace = params["mode"] == "replace"
+    try:
+        path, ext = tool.model_file(ws, params.get("path"))
+        got = await tool.bring_in(ws, path, ext, replace=replace, by="app")
+    except (S.SceneError, engine.EngineError) as e:
+        return {"ok": False, "error": str(e)}
+    if replace:
+        rel = path.relative_to(pathlib.Path(ws.root).resolve()).as_posix()
+        await asyncio.to_thread(store.opened, ws, rel, path, got["added"])
+    return {"ok": True, "rev": got["saved"]["rev"], "added": len(got["added"]), "camera": got["camera"],
+            "notes": got["notes"][:8]}
+
+
 VIDEO_OPS = {"video_start", "video_chunk", "video_finish", "video_cancel", "video_jobs"}
 
 
@@ -146,6 +167,11 @@ def studio_router(ws_dep, user_dep):
         op = body.get("op")
         if op == "open":
             return await _open(ws, body)
+        if op == "open_file":
+            refusal = _budget(ws.subject, op)
+            if refusal:
+                raise HTTPException(429, refusal)
+            return await _open_file(ws, body)
         if op in VIDEO_OPS:
             refusal = _budget(ws.subject, op)
             if refusal:
